@@ -211,14 +211,14 @@ All thresholds are named constants — nothing is hardcoded in rule logic.
 
 ## Auth code classification
 
-Auth codes are classified into four buckets. Code 59 (Suspected Fraud) is HIGH_RISK (MEDIUM), not HIGH, to allow accumulation with other signals before blocking.
+Auth codes are classified into four buckets. Code 59 (Suspected Fraud) is MID (MEDIUM), not HIGH, to allow accumulation with other signals before blocking.
 
 | Bucket | Level | Examples |
 |---|---|---|
-| `AUTH_INSTANT_BLOCK` | HIGH | 04, 07, 41, 43, 46, 62, 63, 78, 83, 103, 871, 872, 886, 888 |
-| `AUTH_HIGH_RISK` | MEDIUM | 59, 93, 100, 870, 873, 874, 997, 998, 999, 9G |
+| `AUTH_HIGH` | HIGH | 04, 07, 41, 43, 46, 62, 63, 78, 83, 103, 871, 872, 886 |
+| `AUTH_MID` | MEDIUM | 59, 93, 100, 870, 873, 874, 997, 998, 999, 9G, 888 |
 | `AUTH_FLAG` | LOW | 01, 02, 05, 57, 58, 61, 65, 82, 97, N7 |
-| `AUTH_FLAG_LOW` | FLAG_LOW | 51, 54, 72 — escalate to HIGH if 3+ consecutive |
+| `AUTH_LOW` | FLAG_LOW | 51, 54, 72 — escalate to HIGH if 3+ consecutive |
 | `AUTH_IGNORE` | — | 03, 06, 10, 12, 13, 14, 15, 19, 25, 28, 91, 96, 99, 887, 889 |
 
 Use `AUTH_CODE_RISK_OVERRIDE` and `AUTH_CODE_SCORE_OVERRIDE` dicts to tune individual codes without touching the sets.

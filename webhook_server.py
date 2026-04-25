@@ -69,7 +69,9 @@ _name_freq:    dict        = {}
 # ── Shared helpers (mirrored from fetch_and_score.py — no cross-import) ───────
 
 _BLOCKED_LIST_COLS = fd._BLOCKED_FIELDS + [
-    "full_name", "reason_summary", "added_at", "source",
+    "full_name",
+    "all_card_ips", "all_card_emails", "all_card_tokens", "all_card_streets", "all_full_names",
+    "reason_summary", "added_at", "source",
 ]
 
 
@@ -203,8 +205,11 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame)
         if explanation:
             print(f"  Match:     {explanation}")
 
-    _IB_RULES = {"IP_BLOCKED", "TOKEN_BLOCKED", "EMAIL_BLOCKED"}
-    if _IB_RULES & set(rules_trig.replace(" ", "").split(",")):
+    triggered = set(rules_trig.replace(" ", "").split(","))
+    _show_banner = bool({"IP_BLOCKED", "TOKEN_BLOCKED"} & triggered)
+    if not _show_banner and "EMAIL_BLOCKED" in triggered:
+        _show_banner = int(result_row.get("_r03_score", 0) or 0) == 100
+    if _show_banner:
         print(LINE)
         print("  !! INSTANT BAN !!")
 
@@ -410,10 +415,17 @@ def _append_to_blocked_list(tx_df: pd.DataFrame, reason_summary: str) -> bool:
 
     first = new_entry.get("card_first_name", "")
     last  = new_entry.get("card_last_name", "")
-    new_entry["full_name"]      = f"{first} {last}".strip().lower()
-    new_entry["reason_summary"] = reason_summary
-    new_entry["added_at"]       = datetime.now(UTC).isoformat()
-    new_entry["source"]         = "auto_detected"
+    new_entry["full_name"]       = f"{first} {last}".strip().lower()
+    # Seed all-values columns with the single transaction's values; the next hourly
+    # refresh (dl.download → build_blocked_list) will populate full history.
+    new_entry["all_card_ips"]    = new_entry.get("card_ip", "")
+    new_entry["all_card_emails"] = new_entry.get("card_email", "")
+    new_entry["all_card_tokens"] = new_entry.get("card_token", "")
+    new_entry["all_card_streets"]= new_entry.get("card_street", "")
+    new_entry["all_full_names"]  = new_entry["full_name"]
+    new_entry["reason_summary"]  = reason_summary
+    new_entry["added_at"]        = datetime.now(UTC).isoformat()
+    new_entry["source"]          = "auto_detected"
 
     new_row_df = pd.DataFrame([new_entry])
     combined   = pd.concat([existing, new_row_df], ignore_index=True)
@@ -595,7 +607,14 @@ def webhook() -> tuple:
 
     result_row      = new_result.iloc[0]
     rules_triggered = set(_get_val(result_row, "rules_triggered").replace(" ", "").split(","))
-    fired_instant   = rules_triggered & INSTANT_BLOCK_RULES
+    fired_instant: set = set()
+    if "TOKEN_BLOCKED" in rules_triggered:
+        fired_instant.add("TOKEN_BLOCKED")
+    if "EMAIL_BLOCKED" in rules_triggered:
+        # Auto-block only on exact email match (score == 100); fuzzy matches flag for review only
+        email_score = int(result_row.get("_r03_score", 0) or 0)
+        if email_score == 100:
+            fired_instant.add("EMAIL_BLOCKED")
 
     if fired_instant:
         reason_summary = _get_val(result_row, "reason_summary")

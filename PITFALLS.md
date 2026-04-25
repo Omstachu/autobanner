@@ -122,7 +122,7 @@ If you add other `groupby().apply()` calls, you'll need to do the same.
 
 ## Auth Code 59 Is MEDIUM, Not HIGH
 
-Code 59 ("Suspected Fraud") is intentionally placed in `AUTH_HIGH_RISK` (MEDIUM) rather than `AUTH_INSTANT_BLOCK` (HIGH). This is by design: it accumulates with other signals rather than triggering an instant block on its own. Don't move it to HIGH without understanding the false-positive impact.
+Code 59 ("Suspected Fraud") is intentionally placed in `AUTH_MID` (MEDIUM) rather than `AUTH_HIGH` (HIGH). This is by design: it accumulates with other signals rather than triggering an instant block on its own. Don't move it to HIGH without understanding the false-positive impact.
 
 ---
 

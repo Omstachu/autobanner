@@ -72,7 +72,9 @@ Only the **alphabetically first file** in `payments/` is used. There should be e
 
 ### `live_payments.csv`
 
-Written by the webhook server at the project root (not in `payments/`). Every transaction the server processes is appended here. On restart, the server merges this file back into its in-memory history so per-customer rules have full context even after a crash.
+Written by the webhook server at the project root (not in `payments/`). Every transaction the server processes is appended here as it arrives.
+
+`live_payments.csv` serves two purposes: during normal operation, `_history_df` is the live in-memory store — every incoming webhook is appended to it immediately. `live_payments.csv` is written in parallel as a durable record. On restart, `_load_state()` merges it back into `_history_df` so those transactions aren't lost. Think of it as the write-ahead log that makes `_history_df` restartable — it is not needed for in-session history, only for recovery across restarts.
 
 ### `female_names.csv`
 
@@ -185,7 +187,7 @@ Default weights: HIGH=100, MEDIUM=50, LOW=10, FLAG_LOW=5. Individual rules can o
 
 **Rule 17 — EMAIL_NAME_MISMATCH**: fires LOW when the email local part looks name-formatted (two or more alpha tokens of 3+ characters, e.g. `john.smith`) but none of those tokens fuzzy-match the card first or last name at ≥75%. Catches emails that belong to a different person than the card.
 
-**Sub-flag: GENDER_SWITCH**: part of Rule 16. Fires MEDIUM when the same customer's card names switch between female-coded and male-coded first names across transactions. Requires `female_names.csv`.
+**Sub-flag: GENDER_SWITCH**: part of Rule 16. Fires MEDIUM when the same customer's card names switch between female-coded and non-female-coded first names across transactions. There is no male names CSV — any name not in `female_names.csv` is treated as non-female. The rule fires when `any_female & ~all_female`: at least one name across the customer's history is female-coded and at least one is not. Gender-neutral names that happen to not be in the female list are treated as male, which is an approximation. The rule is calibrated to catch the common fraud pattern (account shared between different people of different genders) rather than eliminate all false positives.
 
 #### Geographic Rules
 
@@ -249,7 +251,7 @@ This is a Flask application that replaces the manual `fetch_and_score.py` workfl
 #### Startup sequence
 
 1. Downloads the last 2 days of payments from the Coinflow API (calls `download_payments.py` as a module) — unless `--skip-download` is passed
-2. Loads `blocked_users.csv`, the payments CSV from `payments/`, and merges `live_payments.csv` (crash recovery) into the in-memory `_history_df`
+2. Loads `blocked_users.csv`, the payments CSV from `payments/`, and merges `live_payments.csv` (durable log — recovers transactions seen since last start) into the in-memory `_history_df`
 3. Starts the hourly background refresh thread
 4. Starts Flask
 
@@ -263,7 +265,7 @@ This is a Flask application that replaces the manual `fetch_and_score.py` workfl
 
 4. **Under the lock**:
    - Appends the new transaction to `_history_df` (in-memory)
-   - Appends to `live_payments.csv` (crash recovery), aligning to the file's existing column schema to prevent misalignment when different API responses have different fields
+   - Appends to `live_payments.csv` (durable audit log), aligning to the file's existing column schema to prevent misalignment when different API responses have different fields
    - Builds `scoring_df` = this customer's history + the new transaction
 
 5. **Score**: calls `fd.score_all()` with the current `_blocked_df` snapshot
@@ -555,10 +557,18 @@ The `POST /reload` endpoint (mentioned above) then lets the cron job signal the 
 
 If you want to get to production as quickly as possible without a full database migration:
 
-1. Deploy `webhook_server.py` on a VPS or PaaS (single instance, gunicorn)
-2. Point Coinflow webhooks at the deployed URL
-3. Run `download_payments.py --days 1` as a daily cron job on the same server
-4. Set `COINFLOW_VALIDATION_KEY` in the server environment
-5. Mount `blocked_users.csv` and `payments/` as persistent volumes (not ephemeral container storage)
+1. **Containerize**: build the Docker image (Dockerfile + `gunicorn -w 1 -b 0.0.0.0:5000 webhook_server:app`). Keep `-w 1` — all state is process-local; multiple workers would have diverging `_history_df`.
 
-That gives you a live, auto-scoring fraud detection service that writes results to the console (which you redirect to your logging system). The backoffice integration and database migration can happen incrementally after that.
+2. **Persistent storage**: mount a volume at `/data`; point `BLOCKED_LIST_PATH`, `LIVE_PAYMENTS_PATH`, and `payments/` at it. Without persistence, every redeploy loses history and blocked users.
+
+3. **Deploy**: Railway, Render, or Fly.io all support single-process persistent containers with minimal config. Set `COINFLOW_API_KEY` and `COINFLOW_VALIDATION_KEY` as environment secrets.
+
+4. **Wire webhook**: in Coinflow dashboard → Developers → Webhooks, set URL to `https://your-domain/webhook`. The signature verification (`COINFLOW_VALIDATION_KEY`) is what prevents spoofed webhooks.
+
+5. **Daily refresh**: add a scheduled task (`download_payments.py --yesterday`) on the same server. This keeps `blocked_users.csv` and the payments CSV fresh. The webhook server's hourly background refresh already covers intra-day gaps — the daily job just ensures a clean merge after the day rolls over.
+
+6. **Startup refresh**: already handled — the server calls `dl.download(since=2 days ago)` on startup automatically unless `--skip-download` is passed. No manual step needed.
+
+7. **Observability**: Flask logs to stdout/stderr, which container platforms forward to their log aggregator automatically. To get fraud signals into a Slack channel or PagerDuty, add a `requests.post` to a Slack webhook URL inside `_print_result()` when `risk_level == "HIGH"`.
+
+**Key constraint**: the single-process requirement is the biggest architectural limit. If you later need horizontal scaling or zero-downtime deploys, the state needs to move to a shared store (Redis for sets, PostgreSQL for history). That's a real rewrite but not urgent at current volume.

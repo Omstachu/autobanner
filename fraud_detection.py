@@ -35,6 +35,10 @@ MIN_RISK_THRESHOLD = 5
 # Fuzzy match similarity threshold — all fuzzy rules use this single threshold
 FUZZY_MATCH_THRESHOLD = 90
 
+# EMAIL_BLOCKED level split: ≥ this → HIGH risk level; 90–94% → MEDIUM (review only)
+# Auto-block (webhook_server.py) requires exact match (score == 100), not just HIGH level
+EMAIL_BLOCKED_HIGH_THRESHOLD = 95
+
 # City mismatch: fuzzy passthrough to avoid false positives on abbreviations
 FUZZY_CITY_PASS_THRESHOLD = 80
 
@@ -56,20 +60,20 @@ PUBLIC_IP_LEGITIMATE_USER_THRESHOLD = 10
 # Geographic risk — cities only (states are no longer checked)
 RISKY_CITY_LIST            = ["Brooklyn", "Miami", "Atlanta", "Queens", "Bronx", "The Bronx", "Newark", "Washington"]
 RISKY_CITY_FUZZY_THRESHOLD = 85   # catch misspellings like "Brookly" → Brooklyn
-RISKY_STATE_LIST           = ["NC", "AL", "TN"]   # kept for reference; no longer used in rules
+RISKY_STATE_LIST           = ["NC", "AL", "TN", "NY"]   # kept for reference; no longer used in rules
 
 # Auth code classifications (leading zeros preserved as strings)
-AUTH_INSTANT_BLOCK = {
+AUTH_HIGH = {
     "04", "07", "41", "43", "46", "62", "63",
-    "78", "83", "103", "871", "872", "886", "888",
+    "78", "83", "103", "871", "872", "886",
 }
-AUTH_HIGH_RISK = {
-    "59", "93", "873", "870", "997", "998", "9G", "100", "874", "999",
+AUTH_MID = {
+    "59", "93", "873", "870", "997", "998", "9G", "100", "874", "999", "888",
 }
 AUTH_FLAG = {
     "01", "02", "05", "57", "58", "61", "65", "82", "97", "N7",
 }
-AUTH_FLAG_LOW = {"51", "54", "72"}   # escalate to HIGH if 3+ consecutive
+AUTH_LOW = {"51", "54", "72"}   # escalate to HIGH if 3+ consecutive
 AUTH_IGNORE = {
     "03", "06", "10", "12", "13", "14", "15", "19",
     "25", "28", "91", "96", "887", "889", "99",
@@ -130,37 +134,54 @@ AUTH_CODE_TITLES = {
 # Per-rule score overrides — keys are (rule_name, risk_level_name).
 # If a key is absent, falls back to the level default (WEIGHT_* constants above).
 # Edit values here to tune individual rules without touching rule logic.
+# Rules at the level default (HIGH=100, MEDIUM=50, LOW=10, FLAG_LOW=5) are listed explicitly
+# so they can be tuned per-rule without changing the global defaults. Weights above 100 mean
+# the signal is strong enough to dominate the score even without corroboration from other rules.
 RULE_WEIGHTS: dict = {
+    # Auth code passthrough — weights mirror level defaults; listed so individual codes can be
+    # overridden via AUTH_CODE_SCORE_OVERRIDE without raising the level defaults for everything
     ("AUTH_CODES",          "HIGH"):     100,
     ("AUTH_CODES",          "MEDIUM"):   50,
     ("AUTH_CODES",          "LOW"):      10,
     ("AUTH_CODES",          "FLAG_LOW"): 5,
-    ("TOKEN_BLOCKED",       "HIGH"):     150,  # very strong signal
+
+    # Identity match against blocked list
+    ("TOKEN_BLOCKED",       "HIGH"):     150,  # card token is globally unique — a match is near-certain fraud
     ("BIN_COUNTRY",         "HIGH"):     100,
-    ("EMAIL_BLOCKED",       "HIGH"):     100,
-    ("EMAIL_BLOCKED",       "MEDIUM"):   50,
+    ("EMAIL_BLOCKED",       "HIGH"):     100,  # ≥95% fuzzy match; auto-block requires score == 100
+    ("EMAIL_BLOCKED",       "MEDIUM"):   50,   # 90–94% fuzzy match — needs corroboration
     ("EMAIL_BLOCKED",       "LOW"):      10,
-    ("NAME_BLOCKED",        "HIGH"):     100,
-    ("NAME_BLOCKED",        "MEDIUM"):   50,
-    ("NAME_BLOCKED",        "FLAG_LOW"): 5,
+    ("NAME_BLOCKED",        "HIGH"):     100,  # rare name — uniqueness raises confidence
+    ("NAME_BLOCKED",        "MEDIUM"):   50,   # common or ambiguous name match
+    ("NAME_BLOCKED",        "FLAG_LOW"): 5,    # very common name (e.g. Smith) — weak on its own
     ("STREET_BLOCKED",      "HIGH"):     100,
     ("IP_BLOCKED",          "HIGH"):     100,
-    ("IP_BLOCKED",          "LOW"):      10,
-    ("FAILED_PATTERNS",     "HIGH"):     100,
+    ("IP_BLOCKED",          "LOW"):      10,   # downgraded when IP is shared by >10 legitimate users
+
+    # Behavioral / transaction pattern signals
+    ("FAILED_PATTERNS",     "HIGH"):     100,  # 3+ consecutive hard failures or clear escalation
     ("FAILED_PATTERNS",     "MEDIUM"):   50,
     ("FAILED_PATTERNS",     "LOW"):      10,
+
+    # Account-structure signals
+    ("MULTIPLE_CARD_NAMES", "HIGH"):     150,  # multiple identities on one account — very hard to have legitimately
+    ("GENDER_SWITCH",       "MEDIUM"):   50,   # sub-signal of MULTIPLE_CARD_NAMES; weaker in isolation
     ("FEMALE_NAME",         "MEDIUM"):   50,
-    ("MULTIPLE_CARD_NAMES", "HIGH"):     150,  # strong account-takeover signal
-    ("GENDER_SWITCH",       "MEDIUM"):   50,
+
+    # Mismatch / anomaly signals — weak alone, meaningful when stacked
     ("EMAIL_MISMATCH",      "LOW"):      10,
     ("EMAIL_NAME_MISMATCH", "LOW"):      10,
     ("CITY_MISMATCH",       "LOW"):      10,
     ("SAME_CITY_DIFF_ZIP",  "LOW"):      10,
-    ("GEO_RISK_IP",         "LOW"):      15,   # IP city weighted slightly higher
+    ("GEO_RISK_IP",         "LOW"):      15,   # IP city is harder to spoof than a typed card city
     ("GEO_RISK",            "LOW"):      10,
+
+    # Amount anomalies
     ("AMOUNT_FLAG",         "MEDIUM"):   50,
     ("AMOUNT_FLAG",         "LOW"):      10,
     ("AMOUNT_FLAG",         "FLAG_LOW"): 5,
+
+    # Formatting — near-worthless alone; only relevant when stacked with other signals
     ("CAPITALIZATION",      "FLAG_LOW"): 5,
 }
 
@@ -406,9 +427,33 @@ def _build_lookup_structures(blocked_df: pd.DataFrame) -> dict:
     ctx["blocked_name_list"]     = blocked_df["full_name"].dropna().tolist()
     ctx["blocked_name_cid_list"] = blocked_df["customer_id"].fillna("").tolist()
 
-    ctx["blocked_street_list"] = (
-        blocked_df.get("card_street", pd.Series()).dropna().str.strip().str.lower().tolist()
-    )
+    _street_rows = blocked_df[blocked_df.get("card_street", pd.Series(dtype=str)).notna()].copy()
+    ctx["blocked_street_list"]     = _street_rows["card_street"].str.strip().str.lower().tolist() if "card_street" in _street_rows.columns else []
+    ctx["blocked_street_zip_list"] = _street_rows.get("card_zip", pd.Series(dtype=str)).fillna("").str.strip().tolist()
+
+    # Expand |||‑separated multi-value columns into the primary lookup sets/lists.
+    # build_blocked_list.py populates these so a fraudster's historical IPs/emails/etc.
+    # are all indexed, not just the most recent transaction's values.
+    def _expand_multivalue(series: pd.Series) -> list:
+        result = []
+        for cell in series.dropna():
+            for v in str(cell).split("|||"):
+                v = v.strip()
+                if v:
+                    result.append(v)
+        return result
+
+    if "all_card_ips" in blocked_df.columns:
+        ctx["blocked_ips"].update(_expand_multivalue(blocked_df["all_card_ips"]))
+    if "all_card_tokens" in blocked_df.columns:
+        ctx["blocked_tokens"].update(_expand_multivalue(blocked_df["all_card_tokens"]))
+    if "all_card_emails" in blocked_df.columns:
+        extra = [e.lower() for e in _expand_multivalue(blocked_df["all_card_emails"]) if e]
+        ctx["blocked_email_list"] = list(dict.fromkeys(ctx["blocked_email_list"] + extra))
+    if "all_full_names" in blocked_df.columns:
+        extra = [n.lower() for n in _expand_multivalue(blocked_df["all_full_names"]) if n]
+        ctx["blocked_name_list"] = list(dict.fromkeys(ctx["blocked_name_list"] + extra))
+
     return ctx
 
 
@@ -421,13 +466,13 @@ def rule_01_auth_codes(row: pd.Series, **_) -> list:
         # Per-code override takes precedence over set membership
         if code in AUTH_CODE_RISK_OVERRIDE:
             level = _LEVEL_MAP.get(AUTH_CODE_RISK_OVERRIDE[code], RiskLevel.LOW)
-        elif code in AUTH_INSTANT_BLOCK:
+        elif code in AUTH_HIGH:
             level = RiskLevel.HIGH
-        elif code in AUTH_HIGH_RISK:
+        elif code in AUTH_MID:
             level = RiskLevel.MEDIUM
         elif code in AUTH_FLAG:
             level = RiskLevel.LOW
-        elif code in AUTH_FLAG_LOW:
+        elif code in AUTH_LOW:
             level = RiskLevel.FLAG_LOW
         else:
             continue  # AUTH_IGNORE and unknown codes
@@ -455,9 +500,12 @@ def rule_03_card_email_blocked(row: pd.Series, **_) -> list:
     email = _norm_email(row.get("card_email", ""))
     if not email:
         return []
-    if score >= FUZZY_MATCH_THRESHOLD:
+    if score >= EMAIL_BLOCKED_HIGH_THRESHOLD:
         return [RuleResult("EMAIL_BLOCKED", RiskLevel.HIGH,
                            f"Card email matches blocked user ({score}%)")]
+    if score >= FUZZY_MATCH_THRESHOLD:
+        return [RuleResult("EMAIL_BLOCKED", RiskLevel.MEDIUM,
+                           f"Card email likely matches blocked user ({score}%)")]
     return []
 
 
@@ -576,10 +624,17 @@ def rule_12_street_blocked(row: pd.Series, **_) -> list:
     if score is None or pd.isna(score):
         return []
     score = int(score)
-    if score >= FUZZY_MATCH_THRESHOLD:
-        return [RuleResult("STREET_BLOCKED", RiskLevel.HIGH,
-                           f"Card street fuzzy matches blocked user street ({score}%)")]
-    return []
+    if score < FUZZY_MATCH_THRESHOLD:
+        return []
+    # Skip when both ZIPs are known and differ (same street name in different ZIP = coincidence)
+    raw_card_zip = str(row.get("card_zip", "") or "").strip()
+    raw_match_zip = str(row.get("_r12_matched_zip", "") or "").strip()
+    card_zip  = raw_card_zip[:5].zfill(5) if raw_card_zip else ""
+    match_zip = raw_match_zip[:5].zfill(5) if raw_match_zip else ""
+    if card_zip and match_zip and card_zip != match_zip:
+        return []
+    return [RuleResult("STREET_BLOCKED", RiskLevel.HIGH,
+                       f"Card street fuzzy matches blocked user street ({score}%)")]
 
 
 def rule_14_geo_risk(row: pd.Series, **_) -> list:
@@ -681,7 +736,7 @@ def rule_17_email_name_mismatch(row: pd.Series, **_) -> list:
         if last and fuzz.ratio(tok, last) >= 75:
             return []
     return [RuleResult("EMAIL_NAME_MISMATCH", RiskLevel.LOW,
-                       f"Email name ({', '.join(tokens)}) doesn't match card name ({first} {last})")]
+                       f"{local} → Card name is {first.title()} {last.title()}")]
 
 
 # ── Rule 13: Failed Transaction Patterns (per-customer grouped apply) ────────
@@ -710,7 +765,7 @@ def _analyze_customer_failures(group: pd.DataFrame) -> pd.DataFrame:
             window_codes = []
             for j in range(i - CONSECUTIVE_SOFT_FAILURE_INSTANT_BLOCK + 1, i + 1):
                 codes = _parse_auth_codes(auth_raws[j])
-                window_codes.append(bool(codes and all(c in AUTH_FLAG_LOW for c in codes)))
+                window_codes.append(bool(codes and all(c in AUTH_LOW for c in codes)))
             if all(window_codes):
                 row_results.append(RuleResult(
                     "FAILED_PATTERNS", RiskLevel.HIGH,
@@ -945,19 +1000,28 @@ def _precompute_fuzzy(df: pd.DataFrame, ctx: dict) -> pd.DataFrame:
         df["_r06_matched_name"] = ""
 
     # Rule 12: card_street vs blocked street list
-    blocked_streets = ctx["blocked_street_list"]
+    blocked_streets   = ctx["blocked_street_list"]
+    blocked_street_zips = ctx.get("blocked_street_zip_list", [])
     if blocked_streets:
         queries = df["card_street"].fillna("").str.strip().str.lower().tolist()
-        scores = []
+        scores, matched_zips = [], []
         for q in queries:
             if not q:
-                scores.append(0)
-                continue
+                scores.append(0); matched_zips.append(""); continue
             match = fuzz_process.extractOne(q, blocked_streets, scorer=fuzz.token_sort_ratio)
             scores.append(match[1] if match else 0)
-        df["_r12_score"] = scores
+            if match:
+                idx = match[2]
+                matched_zips.append(
+                    blocked_street_zips[idx] if idx < len(blocked_street_zips) else ""
+                )
+            else:
+                matched_zips.append("")
+        df["_r12_score"]       = scores
+        df["_r12_matched_zip"] = matched_zips
     else:
-        df["_r12_score"] = 0
+        df["_r12_score"]       = 0
+        df["_r12_matched_zip"] = ""
 
     return df
 

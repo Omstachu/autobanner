@@ -30,7 +30,9 @@ BLOCKED_LIST_PATH = "blocked_users.csv"
 PAYMENTS_DIR      = "payments"
 
 _BLOCKED_LIST_COLS = fd._BLOCKED_FIELDS + [
-    "full_name", "reason_summary", "added_at", "source",
+    "full_name",
+    "all_card_ips", "all_card_emails", "all_card_tokens", "all_card_streets", "all_full_names",
+    "reason_summary", "added_at", "source",
 ]
 
 
@@ -123,6 +125,13 @@ def build(input_path: str, output_path: str) -> None:
     name_freq    = fd.load_name_frequency()
     reason_by_customer = _build_reason_by_customer(df, female_names, name_freq)
 
+    # Compute full_name on ALL blocked rows before deduplication (needed for all_full_names)
+    _fn_first = blocked.get("card_first_name", pd.Series(dtype=str)).fillna("")
+    _fn_last  = blocked.get("card_last_name",  pd.Series(dtype=str)).fillna("")
+    blocked = blocked.copy()
+    blocked["full_name"] = (_fn_first + " " + _fn_last).str.strip().str.lower()
+    blocked_all = blocked.copy()  # keep all rows for multi-value aggregation
+
     # Keep most recent transaction per customer
     if "transaction_created_at" in blocked.columns:
         blocked = blocked.sort_values("transaction_created_at", ascending=False)
@@ -133,10 +142,28 @@ def build(input_path: str, output_path: str) -> None:
     available = [f for f in fd._BLOCKED_FIELDS if f in blocked.columns]
     new_rows = blocked[available].copy()
 
-    # Compute full_name
-    first = new_rows.get("card_first_name", pd.Series(dtype=str)).fillna("")
-    last  = new_rows.get("card_last_name",  pd.Series(dtype=str)).fillna("")
-    new_rows["full_name"] = (first + " " + last).str.strip().str.lower()
+    # full_name already on blocked; copy it across
+    new_rows["full_name"] = blocked["full_name"].values
+
+    # Aggregate all unique values per customer into |||‑separated columns
+    _ALL_VALUE_MAP = {
+        "all_card_ips":     "card_ip",
+        "all_card_emails":  "card_email",
+        "all_card_tokens":  "card_token",
+        "all_card_streets": "card_street",
+        "all_full_names":   "full_name",
+    }
+    for new_col, src_col in _ALL_VALUE_MAP.items():
+        if src_col not in blocked_all.columns:
+            new_rows[new_col] = ""
+            continue
+        agg = (
+            blocked_all[["customer_id", src_col]]
+            .dropna(subset=[src_col])
+            .groupby("customer_id")[src_col]
+            .apply(lambda s: "|||".join(sorted({v.strip() for v in s if str(v).strip()})))
+        )
+        new_rows[new_col] = new_rows["customer_id"].map(agg).fillna("")
 
     now_str = datetime.now(UTC).isoformat()
     new_rows["reason_summary"] = new_rows["customer_id"].apply(

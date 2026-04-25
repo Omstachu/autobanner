@@ -1,2 +1,25 @@
+# Secrets
 .env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated data — contains PII / payment records
+payments/
+output/
+blocked_users.csv
+live_payments.csv
+
+# SSA name source files (large, downloadable)
+names/
+
+# Docs that may contain internal schema details
+fraud-detection-schema.docx
+fraud-detection-schema.md
 fraud_detection.md
+
+# macOS
+.DS_Store
