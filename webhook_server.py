@@ -44,6 +44,40 @@ import fraud_detection as fd
 
 load_dotenv()
 
+# ── Terminal colors ────────────────────────────────────────────────────────────
+# Set to "catppuccin" for Catppuccin Mocha palette, or "default" for standard ANSI colors.
+
+COLOR_THEME = "catppuccin"
+
+def _tc(r: int, g: int, b: int) -> str:
+    return f"\033[38;2;{r};{g};{b}m"
+
+_THEMES: dict = {
+    "default": {
+        "red":    "\033[91m",
+        "yellow": "\033[93m",
+        "cyan":   "\033[96m",
+        "green":  "\033[92m",
+        "bold":   "\033[1m",
+        "dim":    "\033[2m",
+        "reset":  "\033[0m",
+    },
+    "catppuccin": {           # Catppuccin Mocha
+        "red":    _tc(243, 139, 168),  # red      #f38ba8
+        "yellow": _tc(249, 226, 175),  # yellow   #f9e2af
+        "cyan":   _tc(137, 220, 235),  # sky      #89dceb
+        "green":  _tc(166, 227, 161),  # green    #a6e3a1
+        "bold":   "\033[1m",
+        "dim":    _tc(166, 173, 200),  # subtext1 #a6adc8
+        "reset":  "\033[0m",
+    },
+}
+
+_C = _THEMES.get(COLOR_THEME, _THEMES["default"])
+
+def _risk_color(level: str) -> str:
+    return {"HIGH": _C["red"], "MEDIUM": _C["yellow"], "LOW": _C["cyan"], "FLAG_LOW": _C["dim"]}.get(level, "")
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 COINFLOW_API_URL         = os.getenv("COINFLOW_API_URL", "https://api.coinflow.cash/api")
@@ -148,6 +182,7 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame)
     W    = 70
     SEP  = "═" * W
     LINE = "─" * W
+    R    = _C["reset"]
 
     tx_row      = tx_df.iloc[0]
     payment_id  = _get_val(tx_row, "payment_id")
@@ -155,45 +190,57 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame)
     amount      = _format_amount(tx_row)
     status      = _get_val(tx_row, "transaction_status")
     cust_url    = _customer_url(customer_id)
+    first       = str(tx_row.get("card_first_name") or "").strip().title()
+    last        = str(tx_row.get("card_last_name")  or "").strip().title()
+    card_name   = f"{first} {last}".strip()
 
-    print(f"\n{SEP}")
+    print(f"\n{_C['green']}{SEP}{R}")
     print(f"[{event_type}]")
 
     if result_df.empty:
         amt_str = f"  |  Amount: {amount}" if amount else ""
-        print(f"Payment: {payment_id}  |  Customer: {customer_id}{amt_str}")
+        if card_name:
+            print(f"{_C['bold']}{card_name}{R}  |  {customer_id}{amt_str}")
+        else:
+            print(f"Payment: {payment_id}  |  Customer: {customer_id}{amt_str}")
         if status:
             print(f"  [{status}]")
-        print("✓ No fraud signals detected")
-        print(SEP)
+        print(f"{_C['green']}✓ No fraud signals detected{R}")
+        print(f"{_C['green']}{SEP}{R}")
         return
 
     result_row = result_df.iloc[0]
     risk_level = _get_val(result_row, "risk_level", "—")
-    risk_score = _get_val(result_row, "risk_score", "0")
-    flag_count = _get_val(result_row, "flag_count", "0")
-    reason_sum = _get_val(result_row, "reason_summary", "")
-    rules_trig = _get_val(result_row, "rules_triggered", "")
+    risk_score   = _get_val(result_row, "risk_score", "0")
+    flag_count   = _get_val(result_row, "flag_count", "0")
+    reason_sum   = _get_val(result_row, "reason_summary", "")
+    rules_trig   = _get_val(result_row, "rules_triggered", "")
+    levels_trig  = _get_val(result_row, "levels_triggered", "")
 
+    color      = _risk_color(risk_level)
     status_str = f"  [{status}]" if status else ""
 
     print(f"Payment:   {payment_id}")
     if fd.PAYMENT_URL_TEMPLATE and payment_id:
         print(f"           {fd.PAYMENT_URL_TEMPLATE.format(payment_id)}")
+    if card_name:
+        print(f"Name:      {_C['bold']}{card_name}{R}")
     print(f"Customer:  {customer_id}")
     if cust_url:
         print(f"           {cust_url}")
     if amount:
         print(f"Amount:    {amount}{status_str}")
     print(LINE)
-    print(f"Risk Level:  {risk_level:<12}  Risk Score: {risk_score:<8}  Flags: {flag_count}")
+    print(f"Risk Level:  {color}{risk_level:<12}{R}  Risk Score: {risk_score:<8}  Flags: {flag_count}")
     print(LINE)
 
     if reason_sum:
         reasons = reason_sum.split(" | ")
+        levels  = [l.strip() for l in levels_trig.split(",") if l.strip()]
         print("Reasons:")
-        for i, r in enumerate(reasons, 1):
-            print(f"  {i}. {r}")
+        for i, (r, lvl) in enumerate(zip(reasons, levels + [""] * len(reasons)), 1):
+            rc = _risk_color(lvl) if lvl else ""
+            print(f"  {i}. {rc}{r}{R}")
 
     matched_cid, matched_url = _matched_blocked_url(result_row)
     explanation = _match_explanation(result_row, tx_row)
@@ -210,10 +257,10 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame)
     if not _show_banner and "EMAIL_BLOCKED" in triggered:
         _show_banner = int(result_row.get("_r03_score", 0) or 0) == 100
     if _show_banner:
-        print(LINE)
-        print("  !! INSTANT BAN !!")
+        print(f"{color}{LINE}{R}")
+        print(f"{_C['bold']}{color}  !! INSTANT BAN !!{R}")
 
-    print(SEP)
+    print(f"{color}{SEP}{R}")
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────

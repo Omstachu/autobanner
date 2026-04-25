@@ -165,7 +165,7 @@ Default weights: HIGH=100, MEDIUM=50, LOW=10, FLAG_LOW=5. Individual rules can o
 
 #### Identity Match Rules (compare against blocked_users.csv)
 
-**Rule 3 — EMAIL_BLOCKED**: fuzzy-matches the card email against every email in `blocked_users.csv` (card and customer emails). Threshold: 90% similarity. Scores: HIGH at ≥90%, MEDIUM at 80–89%, LOW at 70–79%. The matched blocked user's customer ID and URL are surfaced in output.
+**Rule 3 — EMAIL_BLOCKED**: fuzzy-matches the card email against every email in `blocked_users.csv` (card and customer emails). Minimum threshold: 90%. Scores: HIGH at ≥95%, MEDIUM at 90–94%. Below 90% does not fire. Auto-block in the webhook server requires an exact match (score == 100); fuzzy matches flag for manual review only. The matched blocked user's customer ID and URL are surfaced in output.
 
 **Rule 6 — NAME_BLOCKED**: fuzzy-matches the full card name (first + last) against all blocked users' names. Same 90% threshold. Escalates to HIGH for rare names (SSA frequency < 0.01%), de-escalates to FLAG_LOW for very common names (frequency > 0.1%) — because "John Smith" matching another "John Smith" is weak evidence, but "Xiomara Delacroix" matching is very strong.
 
@@ -173,7 +173,7 @@ Default weights: HIGH=100, MEDIUM=50, LOW=10, FLAG_LOW=5. Individual rules can o
 
 **Rule 9 — IP_BLOCKED**: exact match of the card IP. If the IP is shared by more than 10 distinct legitimate customers, downgraded from HIGH to LOW (shared IPs like university networks or VPNs are common among legitimate users).
 
-**Rule 12 — STREET_BLOCKED**: fuzzy match of the billing street address at ≥90%. HIGH severity.
+**Rule 12 — STREET_BLOCKED**: fuzzy match of the billing street address at ≥90%, HIGH severity. Requires matching ZIP when both sides are known — prevents "123 Main St" in different cities from matching.
 
 #### Email & Name Rules
 
@@ -238,7 +238,7 @@ Key output columns: `risk_level`, `risk_score`, `flag_count`, `reason_summary`, 
 
 **The customer ID problem**: the API returns `customer` as a MongoDB ObjectId (e.g., `69ea921d...`), not the UUID displayed in the Coinflow dashboard. The `--customer-id` flag lets you pass the real UUID from the webhook payload or dashboard. Without it, per-customer rules won't match historical transactions because the IDs won't align.
 
-**Auto-block behavior**: if TOKEN_BLOCKED or EMAIL_BLOCKED fires, the customer is automatically appended to `blocked_users.csv` and an `!! INSTANT BAN !!` banner is printed. IP_BLOCKED also prints the banner but does *not* auto-append (shared IPs cause too many false positives).
+**Auto-block behavior**: if TOKEN_BLOCKED fires, or EMAIL_BLOCKED fires on an exact match (score == 100), the customer is automatically appended to `blocked_users.csv` and an `!! INSTANT BAN !!` banner is printed. EMAIL_BLOCKED at 90–99% fuzzy match prints the risk level but does not auto-block. IP_BLOCKED also prints the banner but does *not* auto-append (shared IPs cause too many false positives).
 
 ---
 
@@ -270,7 +270,7 @@ This is a Flask application that replaces the manual `fetch_and_score.py` workfl
 
 5. **Score**: calls `fd.score_all()` with the current `_blocked_df` snapshot
 
-6. **Auto-block**: if TOKEN_BLOCKED or EMAIL_BLOCKED fires, appends the customer to `blocked_users.csv` and updates the in-memory `_blocked_df`
+6. **Auto-block**: if TOKEN_BLOCKED fires, or EMAIL_BLOCKED fires on an exact match (score == 100), appends the customer to `blocked_users.csv` and updates the in-memory `_blocked_df`
 
 #### In-memory history and concurrency
 
@@ -513,7 +513,7 @@ With the scoring API in place, the backoffice integration looks like this:
 2. Server scores the payment and stores the result alongside the transaction
 3. If `risk_level == "HIGH"`, create a review queue entry flagged as urgent
 4. If `risk_level == "MEDIUM"`, create a review queue entry for later review
-5. If instant-ban rules fire (TOKEN_BLOCKED, EMAIL_BLOCKED), auto-block immediately and log it
+5. If TOKEN_BLOCKED fires, or EMAIL_BLOCKED fires on an exact match (score == 100), auto-block immediately and log it
 
 **Backoffice review UI**:
 - Table view: payment ID, customer, amount, risk level, score, top reason, date — sortable by score

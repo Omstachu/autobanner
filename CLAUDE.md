@@ -89,6 +89,11 @@ The live reference file used by every scoring run. One row per known-bad custome
 | `card_ip` | IP address at time of transaction |
 | `card_city`, `card_ip_city`, `card_region`, `card_ip_zip`, `card_zip`, `card_street` | Location fields |
 | `card_token`, `card_last4`, `bin_country` | Card identity fields |
+| `all_card_ips` | All unique IPs used by this customer (`\|\|\|`-separated) |
+| `all_card_emails` | All unique emails used by this customer (`\|\|\|`-separated) |
+| `all_card_tokens` | All unique card tokens used by this customer (`\|\|\|`-separated) |
+| `all_card_streets` | All unique street addresses used by this customer (`\|\|\|`-separated) |
+| `all_full_names` | All unique full names used by this customer (`\|\|\|`-separated) |
 | `reason_summary` | Why this customer was blocked |
 | `added_at` | ISO timestamp when added to the list |
 | `source` | `seeded_csv` (build_blocked_list.py) or `auto_detected` (fetch_and_score.py) |
@@ -112,7 +117,7 @@ Scores a single payment in real-time by fetching it from the Coinflow API and ru
 ══════════════════════════════════════════════════════════════════════
 ```
 
-**Auto-append to blocked list**: a subset of the above — only `TOKEN_BLOCKED` or `EMAIL_BLOCKED` (not `IP_BLOCKED`, since the IP may be shared) triggers an automatic append to `blocked_users.csv`. Controlled by `INSTANT_BLOCK_RULES = {"TOKEN_BLOCKED", "EMAIL_BLOCKED"}` at the top of `fetch_and_score.py`.
+**Auto-append to blocked list**: a subset of the above — only `TOKEN_BLOCKED` or `EMAIL_BLOCKED` (not `IP_BLOCKED`, since the IP may be shared) triggers an automatic append to `blocked_users.csv`. Controlled by `INSTANT_BLOCK_RULES = {"TOKEN_BLOCKED", "EMAIL_BLOCKED"}` at the top of `fetch_and_score.py`. For `EMAIL_BLOCKED` specifically, auto-append in `webhook_server.py` only fires on exact match (score == 100); fuzzy matches (90–99%) flag for review but do not auto-block.
 
 ## Output files
 
@@ -164,7 +169,7 @@ All columns are loaded as strings initially, then coerced to the correct types i
 |---|---|---|---|
 | AUTH_CODES | `auth_codes` | Classifies processor auth codes per configurable lists; per-code level and score overrides supported | varies |
 | BIN_COUNTRY | `bin_country` | Non-US BIN → HIGH | HIGH |
-| EMAIL_BLOCKED | `card_email` | Fuzzy match vs blocked users' emails at ≥`FUZZY_MATCH_THRESHOLD` (90%) | HIGH / MEDIUM / LOW |
+| EMAIL_BLOCKED | `card_email` | Fuzzy match vs blocked users' emails; ≥95% (`EMAIL_BLOCKED_HIGH_THRESHOLD`) → HIGH, 90–94% → MEDIUM; auto-block in webhook server requires exact match (score == 100) | HIGH / MEDIUM / LOW |
 | EMAIL_MISMATCH | `card_email`, `customer_email` | Card email ≠ customer email | LOW |
 | FEMALE_NAME | `card_first_name`, `card_email`, `customer_email` | Female first name on card, or female name in card email local part, or female name in customer email local part (checked separately) | MEDIUM |
 | NAME_BLOCKED | `card_first_name`, `card_last_name` | Fuzzy full-name match vs blocked users; escalates/de-escalates by name rarity | HIGH / MEDIUM / FLAG_LOW |
@@ -173,7 +178,7 @@ All columns are loaded as strings initially, then coerced to the correct types i
 | IP_BLOCKED | `card_ip` | Exact match vs blocked users' IPs; shared IP downgraded if >10 legit users | HIGH / LOW |
 | CITY_MISMATCH | `card_city`, `card_ip_city` | Card city ≠ IP city (with fuzzy passthrough at 80%) | LOW |
 | SAME_CITY_DIFF_ZIP | `card_city`, `card_ip_city`, `card_zip`, `card_ip_zip` | Card city matches IP city but ZIPs differ | LOW |
-| STREET_BLOCKED | `card_street` | Fuzzy match vs blocked users' streets ≥90% | HIGH |
+| STREET_BLOCKED | `card_street` | Fuzzy match vs blocked users' streets ≥90%; skipped if both card ZIP and matched ZIP are known and differ | HIGH |
 | FAILED_PATTERNS | `transaction_status`, `auth_codes`, `total_cents` | Per-customer history: 3+ consecutive failures, escalating amounts, large failed transactions, early-account failure clusters, mid-history failures | HIGH / MEDIUM / LOW |
 | GEO_RISK / GEO_RISK_IP | `card_city`, `card_ip_city` | City in risky list (fuzzy match at 85%); IP city weighted slightly higher (15 vs 10) | LOW |
 | AMOUNT_FLAG | `total_cents` | 99¢ ending (probe pattern) → LOW; non-standard amount on first transaction → LOW; >$100 → FLAG_LOW; >$200 → LOW; >$500 → MEDIUM; >$1000 → MEDIUM ("extremely large"); large FAILED transaction (>$500 and status FAILED) → LOW | FLAG_LOW → MEDIUM |
@@ -189,6 +194,7 @@ All thresholds are named constants — nothing is hardcoded in rule logic.
 |---|---|---|
 | `MIN_RISK_THRESHOLD` | 5 | Min score to appear in output |
 | `FUZZY_MATCH_THRESHOLD` | 90 | Single fuzzy similarity % used by all fuzzy rules (email, name, street) |
+| `EMAIL_BLOCKED_HIGH_THRESHOLD` | 95 | Email fuzzy match ≥ this → HIGH; 90–94% → MEDIUM; auto-block requires score == 100 |
 | `FUZZY_CITY_PASS_THRESHOLD` | 80 | City fuzzy passthrough — avoids false positives on abbreviations |
 | `RISKY_CITY_FUZZY_THRESHOLD` | 85 | Fuzzy match threshold for risky city detection (catches misspellings) |
 | `VALID_AMOUNTS` | [5000, 10000, 50000, 100000] | Standard price points in cents ($50/$100/$500/$1000) |

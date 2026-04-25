@@ -1071,8 +1071,9 @@ def score_transaction(rule_results: list) -> Optional[dict]:
         "risk_level":      highest.risk_level.name,
         "risk_score":      risk_score,
         "flag_count":      len(rule_results),
-        "reason_summary":  " | ".join(r.reason for r in sorted_results),
-        "rules_triggered": ", ".join(r.rule_name for r in sorted_results),
+        "reason_summary":   " | ".join(r.reason for r in sorted_results),
+        "rules_triggered":  ", ".join(r.rule_name for r in sorted_results),
+        "levels_triggered": ", ".join(r.risk_level.name for r in sorted_results),
     }
 
 
