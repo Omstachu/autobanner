@@ -565,16 +565,19 @@ def webhook(token: str) -> tuple:
     except Exception:
         return jsonify({"error": "invalid JSON"}), 400
 
-    event_type = payload.get("eventType", "")
-    if event_type not in HANDLED_EVENT_TYPES:
-        print(f"[{_ts()}] → ignored  eventType={event_type!r}")
-        return jsonify({"status": "ignored", "eventType": event_type}), 200
-
+    event_type  = payload.get("eventType", "")
     data        = payload.get("data", {})
     payment_id  = data.get("id", "")
     customer_id = data.get("customerId", "")
 
+    print(f"[{_ts()}] ← {event_type!r}  id={payment_id!r}  customer={customer_id!r}")
+
+    if event_type not in HANDLED_EVENT_TYPES:
+        print(f"[{_ts()}] → ignored  eventType={event_type!r}")
+        return jsonify({"status": "ignored", "eventType": event_type}), 200
+
     if not payment_id:
+        print(f"[{_ts()}] → rejected  missing data.id  (eventType={event_type!r})")
         return jsonify({"error": "missing data.id"}), 400
 
     print(f"\n[{_ts()}] → {event_type}  payment={payment_id}  customer={customer_id}")
