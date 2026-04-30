@@ -68,8 +68,8 @@ block_customer.py        Block a customer by ID via the Coinflow prod API
 download_payments.py     Download payments from Coinflow API → PostgreSQL DB; auto-updates blocked_users
 build_blocked_list.py    Seed or update blocked_users table from DB or a local payments CSV export
 build_female_names.py    Preprocesses SSA baby name files → female_names.csv
-add_verified_customer.py Add a customer to verified_customers.csv by payment ID
-send_test_webhook.py     Send a signed test webhook to the local server (development/testing)
+add_verified_customer.py Add a customer to the verified_customers DB table by payment ID
+send_test_webhook.py     Send a signed test webhook to the local server or Cloud Run (--url flag for remote)
 db.py                    PostgreSQL data access layer — schema init, CRUD for payments/blocked_users/verified_customers
 webhook_server.py        Real-time webhook server — scores each incoming payment, auto-blocks instant-ban matches via Coinflow API
 seed_payments.py         One-time migration: load payments/ CSV into the DB (delete after use)
@@ -339,3 +339,96 @@ Run `build_female_names.py` once, pointing at the `names/` directory containing 
 - `RISKY_CITY_LIST` — expand based on blocked user IP city output printed at end of each run
 - Failed transaction pattern thresholds — calibrate against confirmed fraud cases
 - `PAYMENT_URL_TEMPLATE` — not yet set
+
+## Google Cloud deployment
+
+The webhook server runs as a Cloud Run service named **`auto-compliance`** in project **`coinflow-slack-notifications`** (project number `447737634551`), region `us-central1`.
+
+### Service URLs
+
+| Resource | Value |
+|---|---|
+| Cloud Run service URL | `https://auto-compliance-jmdtnfwaya-uc.a.run.app` |
+| Webhook endpoint | `https://auto-compliance-jmdtnfwaya-uc.a.run.app/webhook/<WEBHOOK_PATH_TOKEN>` |
+| Artifact Registry image | `us-central1-docker.pkg.dev/coinflow-slack-notifications/cloud-run-source-deploy/auto-compliance` |
+| Cloud SQL instance | `coinflow-slack-notifications:us-central1:fraud-db` (POSTGRES_15, db-f1-micro) |
+| Cloud SQL database | `compliance`, user `webhook` |
+
+### Secret Manager secrets
+
+All secrets are stored in Secret Manager under project `coinflow-slack-notifications` and mounted as environment variables at runtime:
+
+| Secret name | Maps to env var | Purpose |
+|---|---|---|
+| `COINFLOW_API_KEY` | `COINFLOW_API_KEY` | Coinflow REST API authentication |
+| `COINFLOW_VALIDATION_KEY` | `COINFLOW_VALIDATION_KEY` | Webhook signature verification |
+| `DATABASE_URL` | `DATABASE_URL` | Cloud SQL via Unix socket: `postgresql+psycopg2://webhook:<pass>@/compliance?host=/cloudsql/coinflow-slack-notifications:us-central1:fraud-db` |
+| `WEBHOOK_PATH_TOKEN` | `WEBHOOK_PATH_TOKEN` | 48-char hex token embedded in the webhook URL path (replaces IAM auth — org policy blocks `allUsers`) |
+
+### Cloud Run config
+
+- **Min instances: 1** — keeps the server warm; avoids cold-start latency and preserves in-memory state
+- **Max instances: 1** — prevents split state across instances (payment history and blocked list are in-memory)
+- **ANSI colors**: automatically disabled in Cloud Run — `webhook_server.py` detects `K_SERVICE` env var (set by the runtime) and sets `COLOR_THEME = "none"`
+- **Log timestamps**: Eastern time (`America/New_York`) via `ZoneInfo`
+
+### Deploy workflow
+
+```bash
+# 1. Build and push Docker image
+gcloud builds submit \
+  --tag us-central1-docker.pkg.dev/coinflow-slack-notifications/cloud-run-source-deploy/auto-compliance \
+  --project=coinflow-slack-notifications
+
+# 2. Deploy new revision
+gcloud run deploy auto-compliance \
+  --image us-central1-docker.pkg.dev/coinflow-slack-notifications/cloud-run-source-deploy/auto-compliance:latest \
+  --region=us-central1 \
+  --project=coinflow-slack-notifications
+```
+
+Always run both commands from `/Users/omstachu/code/compliance` (the `main` branch worktree — Cloud Build uploads the local directory).
+
+### View logs
+
+```bash
+# Stream live (best for active monitoring)
+gcloud beta logging tail \
+  "resource.type=cloud_run_revision AND resource.labels.service_name=auto-compliance" \
+  --project=coinflow-slack-notifications \
+  --format="value(textPayload)"
+
+# Read recent logs (non-streaming)
+gcloud logging read \
+  "resource.type=cloud_run_revision AND resource.labels.service_name=auto-compliance" \
+  --project=coinflow-slack-notifications \
+  --freshness=30m \
+  --format="value(textPayload)"
+```
+
+Use `gcloud beta logging tail` (not `gcloud logging tail` — the non-beta version does not exist).
+
+### Test against Cloud Run
+
+```bash
+python send_test_webhook.py <paymentId> \
+  --url https://auto-compliance-jmdtnfwaya-uc.a.run.app/webhook/<WEBHOOK_PATH_TOKEN>
+```
+
+### Log format
+
+Every incoming webhook logs a `←` entry line before any filtering:
+```
+[2026-04-30 15:08:26] ← 'Card Payment Declined'  id='...'  customer='...'
+```
+
+Ignored event types (`Withdraw Pending`, `Withdraw Success`, `KYC Success`, etc.) log:
+```
+[2026-04-30 15:07:39] → ignored  eventType='Withdraw Success'
+```
+
+Handled events proceed to full scoring output. `HANDLED_EVENT_TYPES = {"Settled", "Card Payment Authorized", "Card Payment Declined"}`.
+
+### Relationship to coinflow-slack-notifications service
+
+There is a separate older Cloud Run service (`coinflow-slack-notifications`) that handles Slack notifications for the payment team. The `auto-compliance` service is independent — do not modify the older service or its Cloud Run config.
