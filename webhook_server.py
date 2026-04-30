@@ -87,6 +87,7 @@ def _risk_color(level: str) -> str:
 COINFLOW_API_URL         = os.getenv("COINFLOW_API_URL", "https://api.coinflow.cash/api")
 COINFLOW_API_KEY         = os.getenv("COINFLOW_API_KEY", "")
 COINFLOW_VALIDATION_KEY  = os.getenv("COINFLOW_VALIDATION_KEY", "")
+WEBHOOK_PATH_TOKEN       = os.getenv("WEBHOOK_PATH_TOKEN", "")
 
 BLOCKED_LIST_PATH = "blocked_users.csv"  # kept for log messages only
 
@@ -462,7 +463,7 @@ def _append_to_blocked_list(tx_df: pd.DataFrame, reason_summary: str) -> bool:
     new_entry["all_full_names"]   = new_entry["full_name"]
     new_entry["reason_summary"]   = reason_summary
     new_entry["added_at"]         = datetime.now(UTC).isoformat()
-    new_entry["source"]           = "auto_detected"
+    new_entry["source"]           = "webhook_server"
 
     added = db.upsert_blocked_user(new_entry)
 
@@ -571,9 +572,12 @@ def _scheduler_thread() -> None:
 app = Flask(__name__)
 
 
-@app.route("/webhook", methods=["POST"])
-def webhook() -> tuple:
+@app.route("/webhook/<token>", methods=["POST"])
+def webhook(token: str) -> tuple:
     global _history_df
+
+    if WEBHOOK_PATH_TOKEN and token != WEBHOOK_PATH_TOKEN:
+        return jsonify({"error": "not found"}), 404
 
     raw_body = request.get_data()
 
