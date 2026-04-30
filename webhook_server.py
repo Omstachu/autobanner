@@ -136,6 +136,10 @@ def _norm_id(s) -> str:
     return str(s).replace("-", "").lower().strip()
 
 
+def _ts() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _get_val(row, col: str, default: str = "") -> str:
     v = row.get(col, default)
     return str(v).strip() if v and not (isinstance(v, float) and pd.isna(v)) else default
@@ -563,7 +567,7 @@ def webhook(token: str) -> tuple:
 
     event_type = payload.get("eventType", "")
     if event_type not in HANDLED_EVENT_TYPES:
-        print(f"→ ignored  eventType={event_type!r}")
+        print(f"[{_ts()}] → ignored  eventType={event_type!r}")
         return jsonify({"status": "ignored", "eventType": event_type}), 200
 
     data        = payload.get("data", {})
@@ -573,11 +577,11 @@ def webhook(token: str) -> tuple:
     if not payment_id:
         return jsonify({"error": "missing data.id"}), 400
 
-    print(f"\n→ {event_type}  payment={payment_id}  customer={customer_id}")
+    print(f"\n[{_ts()}] → {event_type}  payment={payment_id}  customer={customer_id}")
 
     payment = _fetch_payment(payment_id)
     if payment is None:
-        print(f"→ skipped  payment={payment_id}  (not found in Coinflow API)")
+        print(f"[{_ts()}] → skipped  payment={payment_id}  (not found in Coinflow API)")
         return jsonify({"status": "ok", "note": "payment not found"}), 200
 
     tx_df = _payment_to_df(payment, customer_id_override=customer_id or None)
@@ -655,9 +659,9 @@ def webhook(token: str) -> tuple:
             added = _append_to_blocked_list(tx_df, reason_summary)
         fired_str = ", ".join(sorted(fired_instant))
         if added:
-            print(f"⚠  AUTO-BLOCKED: {fired_str} fired — appended to {BLOCKED_LIST_PATH}")
+            print(f"[{_ts()}] ⚠  AUTO-BLOCKED: {fired_str} fired — appended to {BLOCKED_LIST_PATH}")
         else:
-            print(f"⚠  AUTO-BLOCKED rules fired ({fired_str}) — customer already in blocked list")
+            print(f"[{_ts()}] ⚠  AUTO-BLOCKED rules fired ({fired_str}) — customer already in blocked list")
         print(f"   Reason: {reason_summary}")
         cid_to_block = str(tx_df.iloc[0].get("customer_id", "")).strip()
         blocked_ok = _block_in_coinflow(cid_to_block)
