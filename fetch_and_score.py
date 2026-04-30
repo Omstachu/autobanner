@@ -36,7 +36,10 @@ COINFLOW_API_URL    = os.getenv("COINFLOW_API_URL", "https://api.coinflow.cash/a
 COINFLOW_API_KEY    = os.getenv("COINFLOW_API_KEY", "")
 
 # Rule names that trigger auto-append to blocked_users.csv when they fire
-INSTANT_BLOCK_RULES = {"TOKEN_BLOCKED", "EMAIL_BLOCKED"}
+INSTANT_BLOCK_RULES = {
+    "TOKEN_BLOCKED", "EMAIL_BLOCKED", "AUTH_CODES_INSTANT",
+    "FRAUD_CODE_ZERO_ACCEPT", "MULTI_NAME_LOW_ACCEPT", "IP_FRAUD_CODE_ZERO_ACCEPT",
+}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -342,10 +345,23 @@ def _print_result(tx_df: pd.DataFrame, result_df: pd.DataFrame) -> None:
         if explanation:
             print(f"  Match:     {explanation}")
 
-    _IB_RULES = {"IP_BLOCKED", "TOKEN_BLOCKED", "EMAIL_BLOCKED"}
-    if _IB_RULES & set(rules_trig.replace(" ", "").split(",")):
+    _IB_RULES = {"IP_BLOCKED", "TOKEN_BLOCKED", "EMAIL_BLOCKED", "AUTH_CODES_INSTANT",
+                 "FRAUD_CODE_ZERO_ACCEPT", "MULTI_NAME_LOW_ACCEPT", "IP_FRAUD_CODE_ZERO_ACCEPT"}
+    _IB_LABELS = {
+        "AUTH_CODES_INSTANT":        "Flagged auth code",
+        "TOKEN_BLOCKED":             "Card token matched blocked user",
+        "EMAIL_BLOCKED":             "Email matched blocked user",
+        "IP_BLOCKED":                "IP matched blocked user",
+        "FRAUD_CODE_ZERO_ACCEPT":    "Auth code 59/83 with 0% acceptance rate",
+        "MULTI_NAME_LOW_ACCEPT":     "Multiple card names with low acceptance rate",
+        "IP_FRAUD_CODE_ZERO_ACCEPT": "IP match with 59/83 and 0% acceptance rate",
+    }
+    fired_ib = _IB_RULES & set(rules_trig.replace(" ", "").split(","))
+    if fired_ib:
         print(LINE)
         print("  !! INSTANT BAN !!")
+        labels = ", ".join(_IB_LABELS.get(r, r) for r in sorted(fired_ib))
+        print(f"  Reason: {labels}")
 
     print(SEP)
 
@@ -405,6 +421,7 @@ def score(payment_id: str, blocked_list_path: str, customer_id: str | None = Non
             print(f"⚠  AUTO-BLOCKED: {fired_str} fired — appended to {blocked_list_path}")
         else:
             print(f"⚠  AUTO-BLOCKED rules fired ({fired_str}) — customer already in blocked list")
+        print(f"   Reason: {reason_summary}")
 
 
 def main() -> None:

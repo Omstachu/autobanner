@@ -32,13 +32,13 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, UTC
-from pathlib import Path
 
 import pandas as pd
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
+import db
 import download_payments as dl
 import fraud_detection as fd
 
@@ -88,12 +88,13 @@ COINFLOW_API_URL         = os.getenv("COINFLOW_API_URL", "https://api.coinflow.c
 COINFLOW_API_KEY         = os.getenv("COINFLOW_API_KEY", "")
 COINFLOW_VALIDATION_KEY  = os.getenv("COINFLOW_VALIDATION_KEY", "")
 
-BLOCKED_LIST_PATH    = "blocked_users.csv"
-LIVE_PAYMENTS_PATH   = "live_payments.csv"
-VERIFIED_CUSTOMERS_PATH = "verified_customers.csv"
+BLOCKED_LIST_PATH = "blocked_users.csv"  # kept for log messages only
 
 # Rules that trigger auto-append to blocked_users.csv (not IP_BLOCKED — shared IPs)
-INSTANT_BLOCK_RULES = {"TOKEN_BLOCKED", "EMAIL_BLOCKED"}
+INSTANT_BLOCK_RULES = {
+    "TOKEN_BLOCKED", "EMAIL_BLOCKED", "AUTH_CODES_INSTANT",
+    "FRAUD_CODE_ZERO_ACCEPT", "MULTI_NAME_LOW_ACCEPT", "IP_FRAUD_CODE_ZERO_ACCEPT",
+}
 
 HANDLED_EVENT_TYPES = {"Settled", "Card Payment Authorized", "Card Payment Declined"}
 
@@ -184,9 +185,14 @@ def _match_explanation(result_row, tx_row) -> str:
     return " | ".join(parts)
 
 
-def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame,
-                  success_rate: int | None = None, txn_count: int = 0,
-                  is_verified: bool = False) -> None:
+def _print_result(
+    event_type: str,
+    tx_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    success_rate: int | None = None,
+    txn_count: int = 0,
+    is_verified: bool = False,
+) -> None:
     W    = 70
     SEP  = "═" * W
     LINE = "─" * W
@@ -202,13 +208,13 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame,
     last        = str(tx_row.get("card_last_name")  or "").strip().title()
     card_name   = f"{first} {last}".strip()
 
-    VERIFIED_BADGE = f"{_C['mauve']}⊕ Previously Verified{R}"
+    VERIFIED_BADGE = f" {_C['mauve']}[verified]{R}" if is_verified else ""
 
     def _sr_line() -> str:
-        if success_rate is None:
+        if success_rate is None or txn_count == 0:
             return ""
-        c = _C["green"] if success_rate >= 90 else (_C["blue"] if success_rate >= 70 else _C["red"])
-        return f"Txn History: {c}{success_rate}% success{R}  ({txn_count} transaction(s))"
+        color = _C["green"] if success_rate >= 90 else (_C["blue"] if success_rate >= 70 else _C["red"])
+        return f"  Success rate: {color}{success_rate}%{R} ({txn_count} txn{'s' if txn_count != 1 else ''})"
 
     print(f"\n{_C['green']}{SEP}{R}")
     print(f"[{event_type}]")
@@ -216,13 +222,11 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame,
     if result_df.empty:
         amt_str = f"  |  Amount: {amount}" if amount else ""
         if card_name:
-            print(f"{_C['bold']}{card_name}{R}  |  {customer_id}{amt_str}")
+            print(f"{_C['bold']}{card_name}{R}{VERIFIED_BADGE}  |  {customer_id}{amt_str}")
         else:
-            print(f"Payment: {payment_id}  |  Customer: {customer_id}{amt_str}")
+            print(f"Payment: {payment_id}  |  Customer: {customer_id}{VERIFIED_BADGE}{amt_str}")
         if status:
             print(f"  [{status}]")
-        if is_verified:
-            print(VERIFIED_BADGE)
         sr = _sr_line()
         if sr:
             print(sr)
@@ -245,7 +249,7 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame,
     if fd.PAYMENT_URL_TEMPLATE and payment_id:
         print(f"           {fd.PAYMENT_URL_TEMPLATE.format(payment_id)}")
     if card_name:
-        print(f"Name:      {_C['bold']}{card_name}{R}")
+        print(f"Name:      {_C['bold']}{card_name}{R}{VERIFIED_BADGE}")
     print(f"Customer:  {customer_id}")
     if cust_url:
         print(f"           {cust_url}")
@@ -278,13 +282,27 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame,
         if explanation:
             print(f"  Match:     {explanation}")
 
-    triggered = set(rules_trig.replace(" ", "").split(","))
-    _show_banner = bool({"IP_BLOCKED", "TOKEN_BLOCKED"} & triggered)
+    _IB_LABELS = {
+        "AUTH_CODES_INSTANT":        "Flagged auth code",
+        "TOKEN_BLOCKED":             "Card token matched blocked user",
+        "EMAIL_BLOCKED":             "Email matched blocked user",
+        "IP_BLOCKED":                "IP matched blocked user",
+        "FRAUD_CODE_ZERO_ACCEPT":    "Auth code 59/83 with 0% acceptance rate",
+        "MULTI_NAME_LOW_ACCEPT":     "Multiple card names with low acceptance rate",
+        "IP_FRAUD_CODE_ZERO_ACCEPT": "IP match with 59/83 and 0% acceptance rate",
+    }
+    triggered   = set(rules_trig.replace(" ", "").split(","))
+    _IB_INSTANT = {"IP_BLOCKED", "TOKEN_BLOCKED", "AUTH_CODES_INSTANT",
+                   "FRAUD_CODE_ZERO_ACCEPT", "MULTI_NAME_LOW_ACCEPT", "IP_FRAUD_CODE_ZERO_ACCEPT"}
+    _show_banner = bool(_IB_INSTANT & triggered)
     if not _show_banner and "EMAIL_BLOCKED" in triggered:
         _show_banner = int(result_row.get("_r03_score", 0) or 0) == 100
     if _show_banner:
+        fired_ib = (_IB_INSTANT | {"EMAIL_BLOCKED"}) & triggered
+        labels   = ", ".join(_IB_LABELS.get(r, r) for r in sorted(fired_ib))
         print(f"{color}{LINE}{R}")
         print(f"{_C['bold']}{color}  !! INSTANT BAN !!{R}")
+        print(f"{color}  Reason: {labels}{R}")
 
     print(f"{color}{SEP}{R}")
 
@@ -292,8 +310,9 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame,
 # ── Startup ────────────────────────────────────────────────────────────────────
 
 def _load_state(skip_download: bool = False) -> None:
-    global _history_df, _blocked_df, _female_names, _name_freq
+    global _history_df, _blocked_df, _female_names, _name_freq, _verified_customer_ids
 
+    db.init_db()
     print("Loading fraud detection state...")
 
     if not skip_download:
@@ -302,75 +321,22 @@ def _load_state(skip_download: bool = False) -> None:
         try:
             dl.download(since=since)
         except SystemExit:
-            print("  Warning: payment download failed — continuing with existing CSV.")
+            print("  Warning: payment download failed — continuing with existing DB data.")
         except Exception as exc:
-            print(f"  Warning: payment download failed ({exc}) — continuing with existing CSV.")
+            print(f"  Warning: payment download failed ({exc}) — continuing with existing DB data.")
         print()
 
     _female_names = fd.load_female_names()
     _name_freq    = fd.load_name_frequency()
 
-    # Blocked users
-    blocked_path = Path(BLOCKED_LIST_PATH)
-    if blocked_path.exists():
-        blocked_df = pd.read_csv(blocked_path, dtype=str, encoding="utf-8-sig")
-        if "full_name" not in blocked_df.columns:
-            first = blocked_df.get("card_first_name", pd.Series(dtype=str)).fillna("")
-            last  = blocked_df.get("card_last_name",  pd.Series(dtype=str)).fillna("")
-            blocked_df["full_name"] = (first + " " + last).str.strip().str.lower()
-        _blocked_df = blocked_df
-        print(f"  Loaded {len(_blocked_df):,} blocked users from {BLOCKED_LIST_PATH}")
-    else:
-        print(f"  Warning: {BLOCKED_LIST_PATH!r} not found — scoring against empty blocked list.")
+    _blocked_df = db.load_blocked_users()
+    print(f"  Loaded {len(_blocked_df):,} blocked users from database")
 
-    # Payment history — auto-detect first file in payments/
-    history_df = pd.DataFrame()
-    payments_dir = Path("payments")
-    if payments_dir.exists():
-        csv_files = sorted(
-            f for f in payments_dir.iterdir()
-            if f.suffix.lower() in (".csv", ".xlsx", ".xls")
-        )
-        if csv_files:
-            try:
-                history_df = pd.read_csv(csv_files[0], dtype=str, encoding="utf-8-sig")
-                history_df = history_df.rename(
-                    columns={k: v for k, v in fd.COLUMN_RENAME_MAP.items()
-                             if k in history_df.columns}
-                )
-                print(f"  Loaded {len(history_df):,} transactions from {csv_files[0].name}")
-            except Exception as exc:
-                print(f"  Warning: could not load {csv_files[0]}: {exc}")
-
-    # Merge live_payments.csv if present (crash recovery)
-    live_path = Path(LIVE_PAYMENTS_PATH)
-    if live_path.exists():
-        try:
-            live_df = pd.read_csv(live_path, dtype=str, encoding="utf-8-sig")
-            if not live_df.empty:
-                combined = pd.concat([history_df, live_df], ignore_index=True)
-                if "payment_id" in combined.columns:
-                    before = len(combined)
-                    combined = combined.drop_duplicates(subset=["payment_id"], keep="last")
-                    print(f"  Merged {len(live_df):,} row(s) from {LIVE_PAYMENTS_PATH} "
-                          f"({before - len(combined):,} duplicate(s) removed)")
-                else:
-                    print(f"  Merged {len(live_df):,} row(s) from {LIVE_PAYMENTS_PATH}")
-                history_df = combined
-        except Exception as exc:
-            print(f"  Warning: could not load {LIVE_PAYMENTS_PATH}: {exc}")
-
-    _history_df = history_df
+    _history_df = db.load_payments()
     print(f"  Total history: {len(_history_df):,} transactions")
 
-    # Verified customers
-    verified_path = Path(VERIFIED_CUSTOMERS_PATH)
-    if verified_path.exists():
-        verified_df = pd.read_csv(verified_path, dtype=str, encoding="utf-8-sig")
-        if "customer_id" in verified_df.columns:
-            _verified_customer_ids = set(verified_df["customer_id"].dropna().str.strip().str.lower())
-        print(f"  Loaded {len(_verified_customer_ids):,} verified customer(s) from {VERIFIED_CUSTOMERS_PATH}")
-    print()
+    _verified_customer_ids = db.load_verified_customer_ids()
+    print(f"  Loaded {len(_verified_customer_ids):,} verified customer(s)\n")
 
     if not COINFLOW_VALIDATION_KEY:
         print("Warning: COINFLOW_VALIDATION_KEY not set — signature verification disabled.\n")
@@ -466,30 +432,19 @@ def _payment_to_df(payment: dict, customer_id_override: str | None = None) -> pd
 
 # ── Persistence helpers ────────────────────────────────────────────────────────
 
-def _append_to_live_csv(tx_df: pd.DataFrame) -> None:
-    live_path = Path(LIVE_PAYMENTS_PATH)
-    if not live_path.exists():
-        tx_df.to_csv(live_path, mode="w", header=True, index=False, encoding="utf-8-sig")
-    else:
-        # Align to the header established by the first write so rows never have more
-        # or fewer columns than the header (API responses vary in their totals fields).
-        existing_cols = pd.read_csv(live_path, nrows=0, encoding="utf-8-sig").columns.tolist()
-        aligned = tx_df.reindex(columns=existing_cols, fill_value="")
-        aligned.to_csv(live_path, mode="a", header=False, index=False, encoding="utf-8-sig")
+def _persist_payment(tx_df: pd.DataFrame) -> None:
+    """Persist an incoming payment to the database."""
+    db.upsert_payment(tx_df)
 
 
 def _append_to_blocked_list(tx_df: pd.DataFrame, reason_summary: str) -> bool:
-    """Append to blocked_users.csv and update in-memory _blocked_df. Returns True if added."""
+    """Persist a newly blocked customer to the DB and update in-memory _blocked_df. Returns True if added."""
     global _blocked_df
-    p   = Path(BLOCKED_LIST_PATH)
     row = tx_df.iloc[0]
     customer_id = str(row.get("customer_id", "")).strip()
 
-    if not _blocked_df.empty and "customer_id" in _blocked_df.columns:
-        if customer_id and _norm_id(customer_id) in _blocked_df["customer_id"].fillna("").map(_norm_id).values:
-            return False
-
-    existing = pd.read_csv(p, dtype=str) if p.exists() else pd.DataFrame(columns=_BLOCKED_LIST_COLS)
+    if db.is_customer_blocked(customer_id):
+        return False
 
     new_entry: dict = {}
     for field in fd._BLOCKED_FIELDS:
@@ -497,31 +452,47 @@ def _append_to_blocked_list(tx_df: pd.DataFrame, reason_summary: str) -> bool:
 
     first = new_entry.get("card_first_name", "")
     last  = new_entry.get("card_last_name", "")
-    new_entry["full_name"]       = f"{first} {last}".strip().lower()
+    new_entry["full_name"]        = f"{first} {last}".strip().lower()
     # Seed all-values columns with the single transaction's values; the next hourly
     # refresh (dl.download → build_blocked_list) will populate full history.
-    new_entry["all_card_ips"]    = new_entry.get("card_ip", "")
-    new_entry["all_card_emails"] = new_entry.get("card_email", "")
-    new_entry["all_card_tokens"] = new_entry.get("card_token", "")
-    new_entry["all_card_streets"]= new_entry.get("card_street", "")
-    new_entry["all_full_names"]  = new_entry["full_name"]
-    new_entry["reason_summary"]  = reason_summary
-    new_entry["added_at"]        = datetime.now(UTC).isoformat()
-    new_entry["source"]          = "auto_detected"
+    new_entry["all_card_ips"]     = new_entry.get("card_ip", "")
+    new_entry["all_card_emails"]  = new_entry.get("card_email", "")
+    new_entry["all_card_tokens"]  = new_entry.get("card_token", "")
+    new_entry["all_card_streets"] = new_entry.get("card_street", "")
+    new_entry["all_full_names"]   = new_entry["full_name"]
+    new_entry["reason_summary"]   = reason_summary
+    new_entry["added_at"]         = datetime.now(UTC).isoformat()
+    new_entry["source"]           = "auto_detected"
 
-    new_row_df = pd.DataFrame([new_entry])
-    combined   = pd.concat([existing, new_row_df], ignore_index=True)
-    for col in _BLOCKED_LIST_COLS:
-        if col not in combined.columns:
-            combined[col] = ""
-    combined[_BLOCKED_LIST_COLS].to_csv(p, index=False, encoding="utf-8-sig")
+    added = db.upsert_blocked_user(new_entry)
 
     # Update in-memory blocked_df
+    new_row_df = pd.DataFrame([new_entry])
     for col in _BLOCKED_LIST_COLS:
         if col not in new_row_df.columns:
             new_row_df[col] = ""
     _blocked_df = pd.concat([_blocked_df, new_row_df[_BLOCKED_LIST_COLS]], ignore_index=True)
-    return True
+    return added
+
+
+# ── Coinflow block API ─────────────────────────────────────────────────────────
+
+def _block_in_coinflow(customer_id: str) -> bool:
+    """Block a customer via the Coinflow API. Returns True on success."""
+    if not customer_id or not COINFLOW_API_KEY:
+        return False
+    url = f"{COINFLOW_API_URL}/merchant/blocked/{customer_id}"
+    try:
+        resp = requests.put(
+            url,
+            json={"reason": "Blocked1", "status": "Blocked"},
+            headers={"Authorization": COINFLOW_API_KEY},
+            timeout=15,
+        )
+        return resp.ok
+    except requests.exceptions.RequestException as exc:
+        print(f"  Coinflow block API error: {exc}", file=sys.stderr)
+        return False
 
 
 def _block_in_coinflow(customer_id: str) -> bool:
@@ -554,53 +525,15 @@ def _refresh_state() -> None:
     try:
         dl.download(since=since)
     except SystemExit:
-        print(f"[{ts}] [refresh] Warning: download failed — reloading from existing CSV.")
+        print(f"[{ts}] [refresh] Warning: download failed — reloading from existing DB data.")
     except Exception as exc:
-        print(f"[{ts}] [refresh] Warning: download failed ({exc}) — reloading from existing CSV.")
+        print(f"[{ts}] [refresh] Warning: download failed ({exc}) — reloading from DB.")
 
-    new_female_names = fd.load_female_names()
-    new_name_freq    = fd.load_name_frequency()
-
-    new_blocked_df = pd.DataFrame()
-    blocked_path = Path(BLOCKED_LIST_PATH)
-    if blocked_path.exists():
-        try:
-            new_blocked_df = pd.read_csv(blocked_path, dtype=str, encoding="utf-8-sig")
-            if "full_name" not in new_blocked_df.columns:
-                first = new_blocked_df.get("card_first_name", pd.Series(dtype=str)).fillna("")
-                last  = new_blocked_df.get("card_last_name",  pd.Series(dtype=str)).fillna("")
-                new_blocked_df["full_name"] = (first + " " + last).str.strip().str.lower()
-        except Exception as exc:
-            print(f"[refresh] Warning: could not reload blocked list: {exc}")
-
-    new_history_df = pd.DataFrame()
-    payments_dir = Path("payments")
-    if payments_dir.exists():
-        csv_files = sorted(
-            f for f in payments_dir.iterdir()
-            if f.suffix.lower() in (".csv", ".xlsx", ".xls")
-        )
-        if csv_files:
-            try:
-                new_history_df = pd.read_csv(csv_files[0], dtype=str, encoding="utf-8-sig")
-                new_history_df = new_history_df.rename(
-                    columns={k: v for k, v in fd.COLUMN_RENAME_MAP.items()
-                             if k in new_history_df.columns}
-                )
-            except Exception as exc:
-                print(f"[refresh] Warning: could not reload payments CSV: {exc}")
-
-    live_path = Path(LIVE_PAYMENTS_PATH)
-    if live_path.exists():
-        try:
-            live_df = pd.read_csv(live_path, dtype=str, encoding="utf-8-sig")
-            if not live_df.empty:
-                combined = pd.concat([new_history_df, live_df], ignore_index=True)
-                if "payment_id" in combined.columns:
-                    combined = combined.drop_duplicates(subset=["payment_id"], keep="last")
-                new_history_df = combined
-        except Exception as exc:
-            print(f"[refresh] Warning: could not reload live payments: {exc}")
+    new_female_names  = fd.load_female_names()
+    new_name_freq     = fd.load_name_frequency()
+    new_blocked_df    = db.load_blocked_users()
+    new_history_df    = db.load_payments()
+    new_verified_ids  = db.load_verified_customer_ids()
 
     new_verified_ids: set = set()
     verified_path = Path(VERIFIED_CUSTOMERS_PATH)
@@ -613,10 +546,10 @@ def _refresh_state() -> None:
             print(f"[refresh] Warning: could not reload verified customers: {exc}")
 
     with _lock:
-        _history_df          = new_history_df
-        _blocked_df          = new_blocked_df
-        _female_names        = new_female_names
-        _name_freq           = new_name_freq
+        _history_df            = new_history_df
+        _blocked_df            = new_blocked_df
+        _female_names          = new_female_names
+        _name_freq             = new_name_freq
         _verified_customer_ids = new_verified_ids
 
     ts2 = datetime.now(UTC).strftime("%H:%M:%S")
@@ -673,7 +606,7 @@ def webhook() -> tuple:
 
     with _lock:
         _history_df = pd.concat([_history_df, tx_df], ignore_index=True)
-        _append_to_live_csv(tx_df)
+        _persist_payment(tx_df)
 
         this_cid = _norm_id(str(tx_df.iloc[0].get("customer_id", "")))
         if this_cid and "customer_id" in _history_df.columns:
@@ -699,6 +632,7 @@ def webhook() -> tuple:
         else:
             history_only = pd.DataFrame()
 
+        is_verified  = _norm_id(this_cid) in _verified_customer_ids
         scoring_df   = pd.concat([history_only, tx_df], ignore_index=True)
         blocked_df   = _blocked_df
         female_names = _female_names
@@ -719,8 +653,8 @@ def webhook() -> tuple:
     else:
         new_result = result_df
 
-    _print_result(event_type, tx_df, new_result, success_rate=success_rate,
-                  txn_count=total_txns, is_verified=is_verified)
+    _print_result(event_type, tx_df, new_result,
+                  success_rate=success_rate, txn_count=total_txns, is_verified=is_verified)
 
     if new_result.empty:
         return jsonify({"status": "ok"}), 200
@@ -728,8 +662,10 @@ def webhook() -> tuple:
     result_row      = new_result.iloc[0]
     rules_triggered = set(_get_val(result_row, "rules_triggered").replace(" ", "").split(","))
     fired_instant: set = set()
-    if "TOKEN_BLOCKED" in rules_triggered:
-        fired_instant.add("TOKEN_BLOCKED")
+    # Non-email instant-ban rules fire unconditionally
+    for rule in INSTANT_BLOCK_RULES - {"EMAIL_BLOCKED"}:
+        if rule in rules_triggered:
+            fired_instant.add(rule)
     if "EMAIL_BLOCKED" in rules_triggered:
         # Auto-block only on exact email match (score == 100); fuzzy matches flag for review only
         email_score = int(result_row.get("_r03_score", 0) or 0)
@@ -747,6 +683,9 @@ def webhook() -> tuple:
             print(f"⚠  AUTO-BLOCKED: {fired_str} fired — appended to {BLOCKED_LIST_PATH}")
         else:
             print(f"⚠  AUTO-BLOCKED rules fired ({fired_str}) — customer already in blocked list")
+        print(f"   Reason: {reason_summary}")
+        cid_to_block = str(tx_df.iloc[0].get("customer_id", "")).strip()
+        blocked_ok = _block_in_coinflow(cid_to_block)
         if blocked_ok:
             print(f"⚠  Blocked in Coinflow: {cid_to_block}")
         else:

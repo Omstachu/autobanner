@@ -1,9 +1,9 @@
 """
-Add a customer to verified_customers.csv by payment ID.
+Add a customer to the verified_customers table by payment ID.
 
 Fetches the payment from the Coinflow API to get the customer ID and card details,
-then appends a row to verified_customers.csv. Being on this list means the customer
-has been previously reviewed — it does not mean they cannot commit fraud.
+then inserts a row into the database. Being on this list means the customer has been
+previously reviewed — it does not mean they cannot commit fraud.
 
 Usage:
     python add_verified_customer.py <paymentId>
@@ -14,24 +14,17 @@ import argparse
 import os
 import sys
 from datetime import datetime, UTC
-from pathlib import Path
 
-import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+import db
 import fraud_detection as fd
 
 load_dotenv()
 
-COINFLOW_API_URL        = os.getenv("COINFLOW_API_URL", "https://api.coinflow.cash/api")
-COINFLOW_API_KEY        = os.getenv("COINFLOW_API_KEY", "")
-VERIFIED_CUSTOMERS_PATH = "verified_customers.csv"
-
-_COLS = [
-    "customer_id", "card_first_name", "card_last_name", "card_email",
-    "note", "added_at", "added_by_payment_id",
-]
+COINFLOW_API_URL = os.getenv("COINFLOW_API_URL", "https://api.coinflow.cash/api")
+COINFLOW_API_KEY = os.getenv("COINFLOW_API_KEY", "")
 
 
 def _flatten(obj: dict, prefix: str = "", sep: str = ".") -> dict:
@@ -91,20 +84,8 @@ def main() -> None:
     email = row.get("card_email", "").strip()
     name  = f"{first} {last}".strip() or "(unknown)"
 
-    verified_path = Path(VERIFIED_CUSTOMERS_PATH)
-    existing = (
-        pd.read_csv(verified_path, dtype=str, encoding="utf-8-sig")
-        if verified_path.exists()
-        else pd.DataFrame(columns=_COLS)
-    )
-
-    if not existing.empty and "customer_id" in existing.columns:
-        already = existing["customer_id"].str.strip().str.lower()
-        if customer_id.strip().lower() in already.values:
-            print(f"Customer {name} ({customer_id}) is already in {VERIFIED_CUSTOMERS_PATH}.")
-            return
-
-    new_row = pd.DataFrame([{
+    db.init_db()
+    added = db.add_verified_customer({
         "customer_id":          customer_id,
         "card_first_name":      first,
         "card_last_name":       last,
@@ -112,18 +93,15 @@ def main() -> None:
         "note":                 args.note,
         "added_at":             datetime.now(UTC).isoformat(),
         "added_by_payment_id":  args.payment_id,
-    }])
+    })
 
-    combined = pd.concat([existing, new_row], ignore_index=True)
-    for col in _COLS:
-        if col not in combined.columns:
-            combined[col] = ""
-    combined[_COLS].to_csv(verified_path, index=False, encoding="utf-8-sig")
+    if not added:
+        print(f"Customer {name} ({customer_id}) is already in the verified list.")
+        return
 
     print(f"Added: {name}  |  {customer_id}")
     if email:
         print(f"Email: {email}")
-    print(f"Saved to {VERIFIED_CUSTOMERS_PATH}")
     print("Note: this flags the customer as previously reviewed, not permanently safe.")
 
 
