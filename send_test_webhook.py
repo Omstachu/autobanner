@@ -1,10 +1,11 @@
 """
-Send a test webhook to the local webhook server with a valid Coinflow-Signature header.
+Send a test webhook to the webhook server with a valid Coinflow-Signature header.
 
 Usage:
     python send_test_webhook.py <paymentId>
     python send_test_webhook.py <paymentId> --customer-id <uuid> --event-type "Card Payment Declined"
     python send_test_webhook.py <paymentId> --port 8080
+    python send_test_webhook.py <paymentId> --url https://auto-compliance-447737634551.us-central1.run.app/webhook/<token>
 """
 
 import argparse
@@ -45,6 +46,7 @@ def main() -> None:
         help="Webhook event type (default: Settled)",
     )
     parser.add_argument("--port", type=int, default=5000, help="Server port (default: 5000)")
+    parser.add_argument("--url", default="", help="Full webhook URL (overrides --port; e.g. https://...run.app/webhook/<token>)")
     args = parser.parse_args()
 
     payload = {
@@ -68,7 +70,7 @@ def main() -> None:
         signature = None
         print("  Warning: COINFLOW_VALIDATION_KEY not set — sending without signature (verification must be disabled on server)")
 
-    url = f"http://localhost:{args.port}/webhook"
+    url = args.url if args.url else f"http://localhost:{args.port}/webhook"
     print(f"  POST {url}")
     print(f"  eventType: {args.event_type}  paymentId: {args.payment_id}")
 
