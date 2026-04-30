@@ -24,6 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import db
 import fraud_detection as fd
 
 BLOCKED_LIST_PATH = "blocked_users.csv"
@@ -200,6 +201,78 @@ def build(input_path: str, output_path: str) -> None:
     if already_existed:
         print(f"  Already present:   {already_existed:,} (skipped)")
     print(f"  Total in list:     {len(combined):,}")
+
+
+def build_from_db() -> None:
+    """Read payments from DB, rebuild blocked list, upsert into blocked_users table.
+
+    Replaces build(input_path, output_path) for the Cloud Run / DB workflow.
+    Called by download_payments.download() after every refresh.
+    """
+    print("Loading transactions from database...")
+    df = db.load_payments()
+    print(f"  Loaded {len(df):,} rows")
+
+    if df.empty or "customer_status" not in df.columns:
+        print("No payment data found in database. Nothing to update.")
+        return
+
+    blocked = df[df["customer_status"].str.strip() == "Blocked"].copy()
+    if blocked.empty:
+        print("No blocked users found in database. Nothing to update.")
+        return
+    print(f"  Found {len(blocked):,} blocked-status rows")
+
+    print("  Scoring blocked customers to determine reason_summary...")
+    female_names = fd.load_female_names()
+    name_freq    = fd.load_name_frequency()
+    reason_by_customer = _build_reason_by_customer(df, female_names, name_freq)
+
+    _fn_first = blocked.get("card_first_name", pd.Series(dtype=str)).fillna("")
+    _fn_last  = blocked.get("card_last_name",  pd.Series(dtype=str)).fillna("")
+    blocked = blocked.copy()
+    blocked["full_name"] = (_fn_first + " " + _fn_last).str.strip().str.lower()
+    blocked_all = blocked.copy()
+
+    if "transaction_created_at" in blocked.columns:
+        blocked = blocked.sort_values("transaction_created_at", ascending=False)
+    blocked = blocked.drop_duplicates(subset="customer_id", keep="first")
+    print(f"  Deduplicated to {len(blocked):,} unique blocked customers")
+
+    available = [f for f in fd._BLOCKED_FIELDS if f in blocked.columns]
+    new_rows = blocked[available].copy()
+    new_rows["full_name"] = blocked["full_name"].values
+
+    _ALL_VALUE_MAP = {
+        "all_card_ips":     "card_ip",
+        "all_card_emails":  "card_email",
+        "all_card_tokens":  "card_token",
+        "all_card_streets": "card_street",
+        "all_full_names":   "full_name",
+    }
+    for new_col, src_col in _ALL_VALUE_MAP.items():
+        if src_col not in blocked_all.columns:
+            new_rows[new_col] = ""
+            continue
+        agg = (
+            blocked_all[["customer_id", src_col]]
+            .dropna(subset=[src_col])
+            .groupby("customer_id")[src_col]
+            .apply(lambda s: "|||".join(sorted({v.strip() for v in s if str(v).strip()})))
+        )
+        new_rows[new_col] = new_rows["customer_id"].map(agg).fillna("")
+
+    now_str = datetime.now(UTC).isoformat()
+    new_rows["reason_summary"] = new_rows["customer_id"].apply(
+        lambda cid: reason_by_customer.get(str(cid).strip(), "Blocked in Coinflow")
+    )
+    new_rows["added_at"] = now_str
+    new_rows["source"]   = "seeded_csv"
+
+    for _, row in new_rows.iterrows():
+        db.upsert_blocked_user_full(row.to_dict())
+
+    print(f"\nUpserted {len(new_rows):,} blocked users to database")
 
 
 def main() -> None:

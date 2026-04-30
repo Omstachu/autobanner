@@ -75,8 +75,16 @@ AUTH_FLAG = {
 }
 AUTH_LOW = {"51", "54", "72"}   # escalate to HIGH if 3+ consecutive
 AUTH_IGNORE = {
-    "03", "06", "10", "12", "13", "14", "15", "19",
+    "03", "06", "10", "12", "13", "14", "19",
     "25", "28", "91", "96", "887", "889", "99",
+}
+
+# Codes that trigger auto-append to blocked_users (same pipeline as TOKEN_BLOCKED/EMAIL_BLOCKED)
+AUTH_CODE_INSTANT_BAN = {
+    "04", "07", "41", "43", "46", "62", "63", "78", "871", "872", "886",  # AUTH_HIGH
+    "54", "72",   # AUTH_LOW
+    "93",         # AUTH_MID
+    "15",         # was AUTH_IGNORE — No Such Issuer
 }
 
 # Per-auth-code risk level override — takes precedence over AUTH_* set membership.
@@ -126,6 +134,7 @@ AUTH_CODE_TITLES = {
     "82": "CVV Mismatch",
     "97": "CVV Mismatch",
     "N7": "CVV Mismatch",
+    "15": "No Such Issuer",
     "51": "Insufficient Funds",
     "54": "Expired Card",
     "72": "Account Not Yet Activated",
@@ -144,6 +153,10 @@ RULE_WEIGHTS: dict = {
     ("AUTH_CODES",          "MEDIUM"):   50,
     ("AUTH_CODES",          "LOW"):      10,
     ("AUTH_CODES",          "FLAG_LOW"): 5,
+    ("AUTH_CODES_INSTANT",  "HIGH"):     100,
+    ("AUTH_CODES_INSTANT",  "MEDIUM"):   50,
+    ("AUTH_CODES_INSTANT",  "LOW"):      10,
+    ("AUTH_CODES_INSTANT",  "FLAG_LOW"): 5,
 
     # Identity match against blocked list
     ("TOKEN_BLOCKED",       "HIGH"):     150,  # card token is globally unique — a match is near-certain fraud
@@ -164,9 +177,12 @@ RULE_WEIGHTS: dict = {
     ("FAILED_PATTERNS",     "LOW"):      10,
 
     # Account-structure signals
-    ("MULTIPLE_CARD_NAMES", "HIGH"):     150,  # multiple identities on one account — very hard to have legitimately
-    ("GENDER_SWITCH",       "MEDIUM"):   50,   # sub-signal of MULTIPLE_CARD_NAMES; weaker in isolation
-    ("FEMALE_NAME",         "MEDIUM"):   50,
+    ("MULTIPLE_CARD_NAMES",       "HIGH"):   150,  # multiple identities on one account — very hard to have legitimately
+    ("GENDER_SWITCH",             "MEDIUM"): 50,   # sub-signal of MULTIPLE_CARD_NAMES; weaker in isolation
+    ("FRAUD_CODE_ZERO_ACCEPT",    "HIGH"):   100,  # 59/83 + 0% acceptance rate + 3+ transactions
+    ("MULTI_NAME_LOW_ACCEPT",     "HIGH"):   150,  # multiple names + <50% acceptance + 3+ transactions
+    ("IP_FRAUD_CODE_ZERO_ACCEPT", "HIGH"):   100,  # IP match + 59/83 + 0% acceptance
+    ("FEMALE_NAME",               "MEDIUM"): 50,
 
     # Mismatch / anomaly signals — weak alone, meaningful when stacked
     ("EMAIL_MISMATCH",      "LOW"):      10,
@@ -474,11 +490,14 @@ def rule_01_auth_codes(row: pd.Series, **_) -> list:
             level = RiskLevel.LOW
         elif code in AUTH_LOW:
             level = RiskLevel.FLAG_LOW
+        elif code in AUTH_CODE_INSTANT_BAN:
+            level = RiskLevel.LOW
         else:
             continue  # AUTH_IGNORE and unknown codes
         title = AUTH_CODE_TITLES.get(code, code)
         score_override = AUTH_CODE_SCORE_OVERRIDE.get(code)
-        results.append(RuleResult("AUTH_CODES", level,
+        rule_name = "AUTH_CODES_INSTANT" if code in AUTH_CODE_INSTANT_BAN else "AUTH_CODES"
+        results.append(RuleResult(rule_name, level,
                                   f"Auth code {code} ({title})",
                                   score_override=score_override))
     return results
@@ -594,10 +613,17 @@ def rule_09_ip_blocked(row: pd.Series, ip_usage_map: dict, **_) -> list:
     ip = _norm_str(row.get("card_ip", ""))
     legit_count = ip_usage_map.get(ip, 0)
     if legit_count > PUBLIC_IP_LEGITIMATE_USER_THRESHOLD:
-        return [RuleResult("IP_BLOCKED", RiskLevel.LOW,
-                           f"IP matches blocked user (shared IP — {legit_count} legit users, downgraded)")]
-    return [RuleResult("IP_BLOCKED", RiskLevel.HIGH,
-                       f"Card IP matches blocked user ({ip})")]
+        results = [RuleResult("IP_BLOCKED", RiskLevel.LOW,
+                              f"IP matches blocked user (shared IP — {legit_count} legit users, downgraded)")]
+    else:
+        results = [RuleResult("IP_BLOCKED", RiskLevel.HIGH,
+                              f"Card IP matches blocked user ({ip})")]
+    if row.get("_cust_ip5983_eligible"):
+        results.append(RuleResult(
+            "IP_FRAUD_CODE_ZERO_ACCEPT", RiskLevel.HIGH,
+            "IP match corroborated by auth code 59/83 with 0% acceptance rate",
+        ))
+    return results
 
 
 def rule_10_city_mismatch(row: pd.Series, **_) -> list:
@@ -747,9 +773,23 @@ def _analyze_customer_failures(group: pd.DataFrame) -> pd.DataFrame:
     auth_raws  = group.get("auth_codes", pd.Series([""] * len(group))).tolist()
     amounts    = group["total_cents"].tolist()
     n          = len(statuses)
+    r16_flags  = group["_r16_flag"].tolist() if "_r16_flag" in group.columns else [False] * n
 
     all_results = []
+    n_accepted_cum = 0
+    has_5983_cum   = False
+    ip5983_eligibles = []
+
     for i in range(n):
+        if statuses[i] != "FAILED":
+            n_accepted_cum += 1
+        cur_codes = _parse_auth_codes(auth_raws[i])
+        if "59" in cur_codes or "83" in cur_codes:
+            has_5983_cum = True
+        n_hist      = i + 1
+        zero_accept = (n_accepted_cum == 0)
+        accept_rate = n_accepted_cum / n_hist
+
         row_results = []
 
         # Consecutive hard FAILEDs
@@ -804,10 +844,23 @@ def _analyze_customer_failures(group: pd.DataFrame) -> pd.DataFrame:
                     "Failures appearing mid-history after previously clean activity (possible account takeover)",
                 ))
 
+        if n_hist >= 3 and has_5983_cum and zero_accept:
+            row_results.append(RuleResult(
+                "FRAUD_CODE_ZERO_ACCEPT", RiskLevel.HIGH,
+                f"Auth code 59/83 present with 0% acceptance rate ({n_hist} transactions)",
+            ))
+        if n_hist >= 3 and bool(r16_flags[i]) and accept_rate < 0.5:
+            row_results.append(RuleResult(
+                "MULTI_NAME_LOW_ACCEPT", RiskLevel.HIGH,
+                f"Multiple card names with {int(accept_rate * 100)}% acceptance rate ({n_hist} transactions)",
+            ))
+        ip5983_eligibles.append(n_hist >= 3 and has_5983_cum and zero_accept)
+
         all_results.append(row_results)
 
     group = group.copy()
-    group["_r13_results"] = all_results
+    group["_r13_results"]          = all_results
+    group["_cust_ip5983_eligible"] = ip5983_eligibles
     return group
 
 
@@ -819,6 +872,8 @@ def run_rule_13(df: pd.DataFrame) -> pd.DataFrame:
     result = df.groupby("customer_id", group_keys=False).apply(_analyze_customer_failures)
     if "_r13_results" not in result.columns:
         result["_r13_results"] = [[] for _ in range(len(result))]
+    if "_cust_ip5983_eligible" not in result.columns:
+        result["_cust_ip5983_eligible"] = False
     # pandas drops the groupby key column from the apply result — restore it
     if "customer_id" not in result.columns:
         result["customer_id"] = df["customer_id"]
