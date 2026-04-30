@@ -32,6 +32,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, UTC
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -136,8 +137,11 @@ def _norm_id(s) -> str:
     return str(s).replace("-", "").lower().strip()
 
 
+_EASTERN = ZoneInfo("America/New_York")
+
+
 def _ts() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _get_val(row, col: str, default: str = "") -> str:
@@ -526,7 +530,7 @@ def _refresh_state() -> None:
     """Download the last 2 hours and reload all in-memory state under the lock."""
     global _history_df, _blocked_df, _female_names, _name_freq, _verified_customer_ids
 
-    ts = datetime.now(UTC).strftime("%H:%M:%S")
+    ts = datetime.now(_EASTERN).strftime("%H:%M:%S")
     since = datetime.now(UTC) - timedelta(hours=2)
     print(f"\n[{ts}] [refresh] Downloading payments since {since.isoformat()[:16]}...")
     try:
@@ -559,7 +563,7 @@ def _refresh_state() -> None:
         _name_freq             = new_name_freq
         _verified_customer_ids = new_verified_ids
 
-    ts2 = datetime.now(UTC).strftime("%H:%M:%S")
+    ts2 = datetime.now(_EASTERN).strftime("%H:%M:%S")
     print(f"[{ts2}] [refresh] Done — {len(new_history_df):,} transactions, "
           f"{len(new_blocked_df):,} blocked users\n")
 
