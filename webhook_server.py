@@ -58,6 +58,8 @@ _THEMES: dict = {
         "yellow": "\033[93m",
         "cyan":   "\033[96m",
         "green":  "\033[92m",
+        "blue":   "\033[94m",
+        "mauve":  "\033[95m",
         "bold":   "\033[1m",
         "dim":    "\033[2m",
         "reset":  "\033[0m",
@@ -67,6 +69,8 @@ _THEMES: dict = {
         "yellow": _tc(249, 226, 175),  # yellow   #f9e2af
         "cyan":   _tc(137, 220, 235),  # sky      #89dceb
         "green":  _tc(166, 227, 161),  # green    #a6e3a1
+        "blue":   _tc(137, 180, 250),  # blue     #89b4fa
+        "mauve":  _tc(203, 166, 247),  # mauve    #cba6f7
         "bold":   "\033[1m",
         "dim":    _tc(166, 173, 200),  # subtext1 #a6adc8
         "reset":  "\033[0m",
@@ -84,8 +88,9 @@ COINFLOW_API_URL         = os.getenv("COINFLOW_API_URL", "https://api.coinflow.c
 COINFLOW_API_KEY         = os.getenv("COINFLOW_API_KEY", "")
 COINFLOW_VALIDATION_KEY  = os.getenv("COINFLOW_VALIDATION_KEY", "")
 
-BLOCKED_LIST_PATH  = "blocked_users.csv"
-LIVE_PAYMENTS_PATH = "live_payments.csv"
+BLOCKED_LIST_PATH    = "blocked_users.csv"
+LIVE_PAYMENTS_PATH   = "live_payments.csv"
+VERIFIED_CUSTOMERS_PATH = "verified_customers.csv"
 
 # Rules that trigger auto-append to blocked_users.csv (not IP_BLOCKED — shared IPs)
 INSTANT_BLOCK_RULES = {"TOKEN_BLOCKED", "EMAIL_BLOCKED"}
@@ -99,6 +104,7 @@ _history_df:  pd.DataFrame = pd.DataFrame()
 _blocked_df:  pd.DataFrame = pd.DataFrame()
 _female_names: set         = set()
 _name_freq:    dict        = {}
+_verified_customer_ids: set = set()
 
 # ── Shared helpers (mirrored from fetch_and_score.py — no cross-import) ───────
 
@@ -178,7 +184,9 @@ def _match_explanation(result_row, tx_row) -> str:
     return " | ".join(parts)
 
 
-def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame) -> None:
+def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame,
+                  success_rate: int | None = None, txn_count: int = 0,
+                  is_verified: bool = False) -> None:
     W    = 70
     SEP  = "═" * W
     LINE = "─" * W
@@ -194,6 +202,14 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame)
     last        = str(tx_row.get("card_last_name")  or "").strip().title()
     card_name   = f"{first} {last}".strip()
 
+    VERIFIED_BADGE = f"{_C['mauve']}⊕ Previously Verified{R}"
+
+    def _sr_line() -> str:
+        if success_rate is None:
+            return ""
+        c = _C["green"] if success_rate >= 90 else (_C["blue"] if success_rate >= 70 else _C["red"])
+        return f"Txn History: {c}{success_rate}% success{R}  ({txn_count} transaction(s))"
+
     print(f"\n{_C['green']}{SEP}{R}")
     print(f"[{event_type}]")
 
@@ -205,6 +221,11 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame)
             print(f"Payment: {payment_id}  |  Customer: {customer_id}{amt_str}")
         if status:
             print(f"  [{status}]")
+        if is_verified:
+            print(VERIFIED_BADGE)
+        sr = _sr_line()
+        if sr:
+            print(sr)
         print(f"{_C['green']}✓ No fraud signals detected{R}")
         print(f"{_C['green']}{SEP}{R}")
         return
@@ -228,8 +249,13 @@ def _print_result(event_type: str, tx_df: pd.DataFrame, result_df: pd.DataFrame)
     print(f"Customer:  {customer_id}")
     if cust_url:
         print(f"           {cust_url}")
+    if is_verified:
+        print(VERIFIED_BADGE)
     if amount:
         print(f"Amount:    {amount}{status_str}")
+    sr = _sr_line()
+    if sr:
+        print(sr)
     print(LINE)
     print(f"Risk Level:  {color}{risk_level:<12}{R}  Risk Score: {risk_score:<8}  Flags: {flag_count}")
     print(LINE)
@@ -335,7 +361,16 @@ def _load_state(skip_download: bool = False) -> None:
             print(f"  Warning: could not load {LIVE_PAYMENTS_PATH}: {exc}")
 
     _history_df = history_df
-    print(f"  Total history: {len(_history_df):,} transactions\n")
+    print(f"  Total history: {len(_history_df):,} transactions")
+
+    # Verified customers
+    verified_path = Path(VERIFIED_CUSTOMERS_PATH)
+    if verified_path.exists():
+        verified_df = pd.read_csv(verified_path, dtype=str, encoding="utf-8-sig")
+        if "customer_id" in verified_df.columns:
+            _verified_customer_ids = set(verified_df["customer_id"].dropna().str.strip().str.lower())
+        print(f"  Loaded {len(_verified_customer_ids):,} verified customer(s) from {VERIFIED_CUSTOMERS_PATH}")
+    print()
 
     if not COINFLOW_VALIDATION_KEY:
         print("Warning: COINFLOW_VALIDATION_KEY not set — signature verification disabled.\n")
@@ -489,11 +524,29 @@ def _append_to_blocked_list(tx_df: pd.DataFrame, reason_summary: str) -> bool:
     return True
 
 
+def _block_in_coinflow(customer_id: str) -> bool:
+    """PUT /merchant/blocked/<id> to block the customer in Coinflow. Returns True on success."""
+    if not customer_id or not COINFLOW_API_KEY:
+        return False
+    url = f"{COINFLOW_API_URL}/merchant/blocked/{customer_id}"
+    try:
+        resp = requests.put(
+            url,
+            json={"reason": "Blocked1", "status": "Blocked"},
+            headers={"Authorization": COINFLOW_API_KEY, "Content-Type": "application/json"},
+            timeout=15,
+        )
+        return resp.ok
+    except requests.exceptions.RequestException as exc:
+        print(f"⚠  Coinflow block API error: {exc}")
+        return False
+
+
 # ── Hourly background refresh ──────────────────────────────────────────────────
 
 def _refresh_state() -> None:
     """Download the last 2 hours and reload all in-memory state under the lock."""
-    global _history_df, _blocked_df, _female_names, _name_freq
+    global _history_df, _blocked_df, _female_names, _name_freq, _verified_customer_ids
 
     ts = datetime.now(UTC).strftime("%H:%M:%S")
     since = datetime.now(UTC) - timedelta(hours=2)
@@ -549,11 +602,22 @@ def _refresh_state() -> None:
         except Exception as exc:
             print(f"[refresh] Warning: could not reload live payments: {exc}")
 
+    new_verified_ids: set = set()
+    verified_path = Path(VERIFIED_CUSTOMERS_PATH)
+    if verified_path.exists():
+        try:
+            verified_df = pd.read_csv(verified_path, dtype=str, encoding="utf-8-sig")
+            if "customer_id" in verified_df.columns:
+                new_verified_ids = set(verified_df["customer_id"].dropna().str.strip().str.lower())
+        except Exception as exc:
+            print(f"[refresh] Warning: could not reload verified customers: {exc}")
+
     with _lock:
-        _history_df   = new_history_df
-        _blocked_df   = new_blocked_df
-        _female_names = new_female_names
-        _name_freq    = new_name_freq
+        _history_df          = new_history_df
+        _blocked_df          = new_blocked_df
+        _female_names        = new_female_names
+        _name_freq           = new_name_freq
+        _verified_customer_ids = new_verified_ids
 
     ts2 = datetime.now(UTC).strftime("%H:%M:%S")
     print(f"[{ts2}] [refresh] Done — {len(new_history_df):,} transactions, "
@@ -619,6 +683,13 @@ def webhook() -> tuple:
         else:
             cust_history = tx_df.copy()
 
+        total_txns = len(cust_history)
+        if total_txns > 0 and "transaction_status" in cust_history.columns:
+            failed_count = int((cust_history["transaction_status"].str.upper() == "FAILED").sum())
+            success_rate = round((total_txns - failed_count) / total_txns * 100)
+        else:
+            success_rate = None
+
         # Exclude the new payment itself from history to avoid double-scoring
         new_pid = _norm_id(str(tx_df.iloc[0].get("payment_id", "")))
         if new_pid and "payment_id" in cust_history.columns:
@@ -632,6 +703,7 @@ def webhook() -> tuple:
         blocked_df   = _blocked_df
         female_names = _female_names
         name_freq    = _name_freq
+        is_verified  = _norm_id(customer_id) in _verified_customer_ids
 
     # Normalize timestamps before scoring (avoids tz-naive/tz-aware comparison errors)
     if "transaction_created_at" in scoring_df.columns:
@@ -647,7 +719,8 @@ def webhook() -> tuple:
     else:
         new_result = result_df
 
-    _print_result(event_type, tx_df, new_result)
+    _print_result(event_type, tx_df, new_result, success_rate=success_rate,
+                  txn_count=total_txns, is_verified=is_verified)
 
     if new_result.empty:
         return jsonify({"status": "ok"}), 200
@@ -667,11 +740,17 @@ def webhook() -> tuple:
         reason_summary = _get_val(result_row, "reason_summary")
         with _lock:
             added = _append_to_blocked_list(tx_df, reason_summary)
-        fired_str = ", ".join(sorted(fired_instant))
+        cid_to_block = str(tx_df.iloc[0].get("customer_id", "")).strip()
+        blocked_ok   = _block_in_coinflow(cid_to_block)
+        fired_str    = ", ".join(sorted(fired_instant))
         if added:
             print(f"⚠  AUTO-BLOCKED: {fired_str} fired — appended to {BLOCKED_LIST_PATH}")
         else:
             print(f"⚠  AUTO-BLOCKED rules fired ({fired_str}) — customer already in blocked list")
+        if blocked_ok:
+            print(f"⚠  Blocked in Coinflow: {cid_to_block}")
+        else:
+            print(f"⚠  Coinflow block API call failed for {cid_to_block} — block manually")
 
     return jsonify({"status": "ok"}), 200
 
