@@ -769,7 +769,7 @@ def rule_17_email_name_mismatch(row: pd.Series, **_) -> list:
 
 def _analyze_customer_failures(group: pd.DataFrame) -> pd.DataFrame:
     group = group.sort_values("transaction_created_at", na_position="last")
-    statuses   = group["transaction_status"].tolist()
+    statuses   = group["transaction_status"].str.upper().tolist()
     auth_raws  = group.get("auth_codes", pd.Series([""] * len(group))).tolist()
     amounts    = group["total_cents"].tolist()
     n          = len(statuses)
