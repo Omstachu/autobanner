@@ -1133,21 +1133,25 @@ def score_transaction(rule_results: list) -> Optional[dict]:
 
 
 def score_all(df: pd.DataFrame, blocked_df: pd.DataFrame,
-              female_names: set, name_freq: dict) -> pd.DataFrame:
+              female_names: set, name_freq: dict, quiet: bool = False) -> pd.DataFrame:
     """Orchestrate all phases and return a scored DataFrame."""
     ctx = _build_lookup_structures(blocked_df)
     ip_usage_map = build_ip_usage_map(df)
 
-    print("  Pre-computing vectorized flags...")
+    if not quiet:
+        print("  Pre-computing vectorized flags...")
     df = _precompute_vectorized(df, blocked_df, ctx, female_names)
 
-    print("  Running batch fuzzy matching (Rules 3, 6, 12)...")
+    if not quiet:
+        print("  Running batch fuzzy matching (Rules 3, 6, 12)...")
     df = _precompute_fuzzy(df, ctx)
 
-    print("  Running per-customer failure pattern analysis (Rule 13)...")
+    if not quiet:
+        print("  Running per-customer failure pattern analysis (Rule 13)...")
     df = run_rule_13(df)
 
-    print("  Scoring each transaction...")
+    if not quiet:
+        print("  Scoring each transaction...")
     scored_rows = []
     for _, row in df.iterrows():
         rule_results = _apply_row_rules(row, female_names, name_freq, ip_usage_map)

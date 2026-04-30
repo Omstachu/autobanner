@@ -23,10 +23,8 @@ Optional .env:
 """
 
 import argparse
-import contextlib
 import hashlib
 import hmac
-import io
 import os
 import sys
 import threading
@@ -489,24 +487,6 @@ def _append_to_blocked_list(tx_df: pd.DataFrame, reason_summary: str) -> bool:
 # ── Coinflow block API ─────────────────────────────────────────────────────────
 
 def _block_in_coinflow(customer_id: str) -> bool:
-    """Block a customer via the Coinflow API. Returns True on success."""
-    if not customer_id or not COINFLOW_API_KEY:
-        return False
-    url = f"{COINFLOW_API_URL}/merchant/blocked/{customer_id}"
-    try:
-        resp = requests.put(
-            url,
-            json={"reason": "Blocked1", "status": "Blocked"},
-            headers={"Authorization": COINFLOW_API_KEY},
-            timeout=15,
-        )
-        return resp.ok
-    except requests.exceptions.RequestException as exc:
-        print(f"  Coinflow block API error: {exc}", file=sys.stderr)
-        return False
-
-
-def _block_in_coinflow(customer_id: str) -> bool:
     """PUT /merchant/blocked/<id> to block the customer in Coinflow. Returns True on success."""
     if not customer_id or not COINFLOW_API_KEY:
         return False
@@ -546,16 +526,6 @@ def _refresh_state() -> None:
     new_history_df    = db.load_payments()
     new_verified_ids  = db.load_verified_customer_ids()
 
-    new_verified_ids: set = set()
-    verified_path = Path(VERIFIED_CUSTOMERS_PATH)
-    if verified_path.exists():
-        try:
-            verified_df = pd.read_csv(verified_path, dtype=str, encoding="utf-8-sig")
-            if "customer_id" in verified_df.columns:
-                new_verified_ids = set(verified_df["customer_id"].dropna().str.strip().str.lower())
-        except Exception as exc:
-            print(f"[refresh] Warning: could not reload verified customers: {exc}")
-
     with _lock:
         _history_df            = new_history_df
         _blocked_df            = new_blocked_df
@@ -579,7 +549,22 @@ def _scheduler_thread() -> None:
 
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
+import logging as _logging
+_logging.getLogger("werkzeug").setLevel(_logging.ERROR)
+
 app = Flask(__name__)
+
+
+@app.before_request
+def _start_timer():
+    request._start = time.monotonic()
+
+
+@app.after_request
+def _log_request(response):
+    elapsed_ms = round((time.monotonic() - request._start) * 1000)
+    print(f"[{_ts()}] {request.method} {response.status_code}  {elapsed_ms}ms")
+    return response
 
 
 @app.route("/webhook/<token>", methods=["POST"])
@@ -604,17 +589,15 @@ def webhook(token: str) -> tuple:
     payment_id  = data.get("id", "")
     customer_id = data.get("customerId", "")
 
-    print(f"[{_ts()}] ← {event_type!r}  id={payment_id!r}  customer={customer_id!r}")
-
     if event_type not in HANDLED_EVENT_TYPES:
-        print(f"[{_ts()}] → ignored  eventType={event_type!r}")
+        print(f"[{_ts()}] {event_type!r} — ignored")
         return jsonify({"status": "ignored", "eventType": event_type}), 200
 
     if not payment_id:
-        print(f"[{_ts()}] → rejected  missing data.id  (eventType={event_type!r})")
+        print(f"[{_ts()}] {event_type!r} — rejected (missing payment id)")
         return jsonify({"error": "missing data.id"}), 400
 
-    print(f"\n[{_ts()}] → {event_type}  payment={payment_id}  customer={customer_id}")
+    print(f"[{_ts()}] {event_type}  payment={payment_id}  customer={customer_id}")
 
     payment = _fetch_payment(payment_id)
     if payment is None:
@@ -651,7 +634,6 @@ def webhook(token: str) -> tuple:
         else:
             history_only = pd.DataFrame()
 
-        is_verified  = _norm_id(this_cid) in _verified_customer_ids
         scoring_df   = pd.concat([history_only, tx_df], ignore_index=True)
         blocked_df   = _blocked_df
         female_names = _female_names
@@ -664,8 +646,7 @@ def webhook(token: str) -> tuple:
             scoring_df["transaction_created_at"], format="mixed", utc=True, errors="coerce"
         )
 
-    with contextlib.redirect_stdout(io.StringIO()):
-        result_df = fd.score_all(scoring_df, blocked_df, female_names, name_freq)
+    result_df = fd.score_all(scoring_df, blocked_df, female_names, name_freq, quiet=True)
 
     if not result_df.empty and new_pid:
         new_result = result_df[result_df["payment_id"].fillna("").map(_norm_id) == new_pid]
@@ -703,8 +684,6 @@ def webhook(token: str) -> tuple:
         else:
             print(f"[{_ts()}] ⚠  AUTO-BLOCKED rules fired ({fired_str}) — customer already in blocked list")
         print(f"   Reason: {reason_summary}")
-        cid_to_block = str(tx_df.iloc[0].get("customer_id", "")).strip()
-        blocked_ok = _block_in_coinflow(cid_to_block)
         if blocked_ok:
             print(f"⚠  Blocked in Coinflow: {cid_to_block}")
         else:

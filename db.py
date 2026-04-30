@@ -389,7 +389,7 @@ def load_verified_customer_ids() -> set:
     try:
         with get_engine().connect() as conn:
             result = conn.execute(text("SELECT customer_id FROM verified_customers"))
-            return {str(row[0]).strip().lower() for row in result if row[0]}
+            return {str(row[0]).replace("-", "").strip().lower() for row in result if row[0]}
     except Exception as exc:
         logger.warning("load_verified_customer_ids failed: %s", exc)
         return set()
