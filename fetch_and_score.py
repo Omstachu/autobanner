@@ -219,7 +219,7 @@ def _append_to_blocked_list(tx_df: pd.DataFrame, reason_summary: str,
     new_entry["full_name"]      = f"{first} {last}".strip().lower()
     new_entry["reason_summary"] = reason_summary
     new_entry["added_at"]       = datetime.now(UTC).isoformat()
-    new_entry["source"]         = "auto_detected"
+    new_entry["source"]         = "fetch_and_score"
 
     new_row = pd.DataFrame([new_entry])
     combined = pd.concat([existing, new_row], ignore_index=True)

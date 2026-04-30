@@ -47,7 +47,8 @@ load_dotenv()
 # ── Terminal colors ────────────────────────────────────────────────────────────
 # Set to "catppuccin" for Catppuccin Mocha palette, or "default" for standard ANSI colors.
 
-COLOR_THEME = "catppuccin"
+# Disable colors in Cloud Run (K_SERVICE is set by the runtime; ANSI codes pollute Cloud Logging)
+COLOR_THEME = "none" if os.getenv("K_SERVICE") else "catppuccin"
 
 def _tc(r: int, g: int, b: int) -> str:
     return f"\033[38;2;{r};{g};{b}m"
@@ -77,6 +78,7 @@ _THEMES: dict = {
     },
 }
 
+_THEMES["none"] = {k: "" for k in _THEMES["default"]}
 _C = _THEMES.get(COLOR_THEME, _THEMES["default"])
 
 def _risk_color(level: str) -> str:
@@ -591,6 +593,7 @@ def webhook(token: str) -> tuple:
 
     event_type = payload.get("eventType", "")
     if event_type not in HANDLED_EVENT_TYPES:
+        print(f"→ ignored  eventType={event_type!r}")
         return jsonify({"status": "ignored", "eventType": event_type}), 200
 
     data        = payload.get("data", {})
@@ -604,6 +607,7 @@ def webhook(token: str) -> tuple:
 
     payment = _fetch_payment(payment_id)
     if payment is None:
+        print(f"→ skipped  payment={payment_id}  (not found in Coinflow API)")
         return jsonify({"status": "ok", "note": "payment not found"}), 200
 
     tx_df = _payment_to_df(payment, customer_id_override=customer_id or None)
