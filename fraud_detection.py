@@ -64,11 +64,11 @@ RISKY_STATE_LIST           = ["NC", "AL", "TN", "NY"]   # kept for reference; no
 
 # Auth code classifications (leading zeros preserved as strings)
 AUTH_HIGH = {
-    "04", "07", "41", "43", "46", "62", "63",
+    "04", "07", "41", "43", "46", "59", "62", "63",
     "78", "83", "103", "871", "872", "886",
 }
 AUTH_MID = {
-    "59", "93", "873", "870", "997", "998", "9G", "100", "874", "999", "888",
+    "93", "873", "870", "997", "998", "9G", "100", "874", "999", "888",
 }
 AUTH_FLAG = {
     "01", "02", "05", "57", "58", "61", "65", "82", "97", "N7",
@@ -182,6 +182,7 @@ RULE_WEIGHTS: dict = {
     ("FRAUD_CODE_ZERO_ACCEPT",    "HIGH"):   100,  # 59/83 + 0% acceptance rate + 3+ transactions
     ("MULTI_NAME_LOW_ACCEPT",     "HIGH"):   150,  # multiple names + <50% acceptance + 2+ transactions
     ("IP_FRAUD_CODE_ZERO_ACCEPT", "HIGH"):   100,  # IP match + 59/83 + 0% acceptance
+    ("FEMALE_ZERO_ACCEPT",        "HIGH"):   100,  # female name + 0% acceptance + IP match or 59/83
     ("FEMALE_NAME",               "MEDIUM"): 50,
 
     # Mismatch / anomaly signals — weak alone, meaningful when stacked
@@ -789,6 +790,8 @@ def _analyze_customer_failures(group: pd.DataFrame) -> pd.DataFrame:
     amounts    = group["total_cents"].tolist()
     n          = len(statuses)
     r16_flags  = group["_r16_flag"].tolist() if "_r16_flag" in group.columns else [False] * n
+    r05_flags  = group["_r05_flag"].tolist() if "_r05_flag" in group.columns else [False] * n
+    r09_flags  = group["_r09_flag"].tolist() if "_r09_flag" in group.columns else [False] * n
 
     all_results = []
     n_accepted_cum = 0
@@ -868,6 +871,12 @@ def _analyze_customer_failures(group: pd.DataFrame) -> pd.DataFrame:
             row_results.append(RuleResult(
                 "MULTI_NAME_LOW_ACCEPT", RiskLevel.HIGH,
                 f"Multiple card names with {int(accept_rate * 100)}% acceptance rate ({n_hist} transactions)",
+            ))
+        if n_hist >= 2 and zero_accept and bool(r05_flags[i]) and (bool(r09_flags[i]) or has_5983_cum):
+            corroboration = "IP matches blocked user" if bool(r09_flags[i]) else "auth code 59/83"
+            row_results.append(RuleResult(
+                "FEMALE_ZERO_ACCEPT", RiskLevel.HIGH,
+                f"Female name with 0% acceptance rate + {corroboration} ({n_hist} transactions)",
             ))
         ip5983_eligibles.append(n_hist >= 3 and has_5983_cum and zero_accept)
 
@@ -1003,9 +1012,11 @@ def _precompute_vectorized(df: pd.DataFrame, blocked_df: pd.DataFrame,
             any_female = df.groupby("customer_id")["_name_female_tmp"].transform("any")
             all_female = df.groupby("customer_id")["_name_female_tmp"].transform("all")
             df["_r16_gender_switch"] = df["_r16_flag"] & any_female & ~all_female
+            df["_r05_flag"] = df["_name_female_tmp"]
             df = df.drop(columns=["_name_female_tmp"])
         else:
             df["_r16_gender_switch"] = False
+            df["_r05_flag"] = False
 
         df = df.drop(columns=["_full_name_tmp"])
     else:

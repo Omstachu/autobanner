@@ -112,13 +112,15 @@ BLOCKED_LIST_PATH = "blocked_users.csv"  # kept for log messages only
 INSTANT_BLOCK_RULES = {
     "TOKEN_BLOCKED", "EMAIL_BLOCKED", "AUTH_CODES_INSTANT",
     "FRAUD_CODE_ZERO_ACCEPT", "MULTI_NAME_LOW_ACCEPT", "IP_FRAUD_CODE_ZERO_ACCEPT",
+    "FEMALE_ZERO_ACCEPT",
 }
 
 HANDLED_EVENT_TYPES = {"Settled", "Card Payment Authorized", "Card Payment Declined"}
 
 _IB_INSTANT = {
-    "IP_BLOCKED", "TOKEN_BLOCKED", "AUTH_CODES_INSTANT",
+    "TOKEN_BLOCKED", "AUTH_CODES_INSTANT",
     "FRAUD_CODE_ZERO_ACCEPT", "MULTI_NAME_LOW_ACCEPT", "IP_FRAUD_CODE_ZERO_ACCEPT",
+    "FEMALE_ZERO_ACCEPT",
 }
 _IB_LABELS = {
     "AUTH_CODES_INSTANT":        "Flagged auth code",
@@ -128,6 +130,7 @@ _IB_LABELS = {
     "FRAUD_CODE_ZERO_ACCEPT":    "Auth code 59/83 with 0% acceptance rate",
     "MULTI_NAME_LOW_ACCEPT":     "Multiple card names with low acceptance rate",
     "IP_FRAUD_CODE_ZERO_ACCEPT": "IP match with 59/83 and 0% acceptance rate",
+    "FEMALE_ZERO_ACCEPT":        "Female name with 0% acceptance rate + IP match or 59/83",
 }
 
 # ── Server state ───────────────────────────────────────────────────────────────
@@ -299,7 +302,9 @@ def _print_result(
     if is_verified:
         print(VERIFIED_BADGE)
     if amount:
-        print(f"Amount:    {amount}{status_str}")
+        auth_codes  = _get_val(tx_row, "auth_codes")
+        auth_suffix = f" ({auth_codes})" if auth_codes and status == "FAILED" else ""
+        print(f"Amount:    {amount}{status_str}{auth_suffix}")
     sr = _sr_line()
     if sr:
         print(sr)
@@ -392,7 +397,9 @@ def _build_slack_blocks(
         if name_str:
             fields.append({"type": "mrkdwn", "text": f"*Name:* {name_str}"})
         if amount:
-            fields.append({"type": "mrkdwn", "text": f"*Amount:* {amount} [{status}]"})
+            auth_codes = _get_val(tx_row, "auth_codes")
+            auth_str   = f" ({auth_codes})" if auth_codes and event_type == "Card Payment Declined" else ""
+            fields.append({"type": "mrkdwn", "text": f"*Amount:* {amount} [{status}{auth_str}]"})
         cid_text = f"<{cust_url}|{customer_id[:8]}...>" if cust_url else customer_id
         if customer_id:
             fields.append({"type": "mrkdwn", "text": f"*Customer:* {cid_text}"})
@@ -933,7 +940,7 @@ def webhook(token: str) -> tuple:
         else:
             print(f"⚠  Coinflow block API call failed for {cid_to_block} — block manually")
         if slack_ts and slack_color:
-            status_text = "Auto-blocked in Coinflow" if blocked_ok else "Auto-block API failed — block manually"
+            status_text = "❌ Auto-blocked in Coinflow" if blocked_ok else "⚠️ Auto-block API failed — block manually"
             updated = [b for b in slack_blocks_orig if b.get("type") != "actions"]
             updated.append({"type": "context",
                              "elements": [{"type": "mrkdwn", "text": status_text}]})
@@ -957,9 +964,9 @@ def slack_actions() -> tuple:
         customer_id = action.get("value", "")
         blocked_ok  = _block_in_coinflow(customer_id)
         status_text = (
-            f"Blocked in Coinflow by @{user}"
+            f"❌ Blocked in Coinflow by @{user}"
             if blocked_ok else
-            f"Block API failed — block manually (@{user} attempted)"
+            f"⚠️ Block API failed — block manually (@{user} attempted)"
         )
         attachments     = payload.get("message", {}).get("attachments") or [{}]
         orig_color      = attachments[0].get("color", _SLACK_COLORS["clean"])
