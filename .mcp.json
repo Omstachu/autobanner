@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "bash",
+      "args": [
+        "-c",
+        "exec uvx --python 3.12 postgres-mcp --access-mode=restricted \"${DATABASE_URL/postgresql+psycopg2:/postgresql:}\""
+      ]
+    }
+  }
+}
