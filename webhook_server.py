@@ -193,6 +193,10 @@ def _customer_url(customer_id: str) -> str:
 
 def _matched_blocked_url(result_row) -> tuple[str, str]:
     threshold = fd.FUZZY_MATCH_THRESHOLD
+    for col in ("_r08_matched_cid", "_r09_matched_cid"):
+        cid = _get_val(result_row, col)
+        if cid:
+            return cid, _customer_url(cid)
     r03_score = int(result_row.get("_r03_score", 0) or 0)
     r06_score = int(result_row.get("_r06_score", 0) or 0)
     if r03_score >= threshold:
@@ -343,6 +347,19 @@ _ET_SHORT = {
     "Card Payment Declined":    "Declined",
 }
 
+_EVENT_COLORS = {
+    "Card Payment Authorized": "#3498db",
+    "Card Payment Declined":   "#e74c3c",
+    "Settled":                 "#2ecc71",
+}
+
+_RISK_EMOJI = {
+    "HIGH":     "🔴",
+    "MEDIUM":   "🟠",
+    "LOW":      "🔵",
+    "FLAG_LOW": "⚪",
+}
+
 
 def _build_slack_blocks(
     event_type: str,
@@ -386,10 +403,10 @@ def _build_slack_blocks(
 
     # ── Clean path ─────────────────────────────────────────────────────────────
     if result_df.empty:
-        color  = _slack_color("clean")
+        color  = _EVENT_COLORS.get(event_type, _slack_color("clean"))
         blocks: list = [
-            {"type": "header", "text": {"type": "plain_text",
-                                        "text": f"{short_event} — No fraud signals"}},
+            {"type": "header", "text": {"type": "plain_text", "emoji": True,
+                                        "text": f"🟢 {short_event} — No fraud signals"}},
         ]
         fields = _id_fields()
         if fields:
@@ -403,43 +420,23 @@ def _build_slack_blocks(
     flag_count  = _get_val(result_row, "flag_count", "0")
     reason_sum  = _get_val(result_row, "reason_summary", "")
     rules_trig  = _get_val(result_row, "rules_triggered", "")
-
-    color  = _slack_color(risk_level)
-    blocks = [
-        {"type": "header", "text": {"type": "plain_text",
-                                    "text": f"{risk_level} — {short_event}"}},
-    ]
-    fields = _id_fields()
-    if fields:
-        blocks.append({"type": "section", "fields": fields})
-
-    blocks.append({"type": "divider"})
-    blocks.append({"type": "section", "text": {"type": "mrkdwn",
-        "text": f"*Risk Score:* {risk_score}  |  *Flags:* {flag_count}"}})
-
-    if reason_sum:
-        lines = [f"{i}. {r}" for i, r in enumerate(reason_sum.split(" | "), 1)]
-        blocks.append({"type": "section", "text": {"type": "mrkdwn",
-            "text": "\n".join(lines)}})
-
-    matched_cid, matched_url = _matched_blocked_url(result_row)
-    explanation = _match_explanation(result_row, tx_row)
-    if matched_cid:
-        link       = f"<{matched_url}|{matched_cid[:8]}...>" if matched_url else matched_cid
-        match_text = f"*Matched blocked user:* {link}"
-        if explanation:
-            match_text += f"\n*Match:* {explanation}"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": match_text}})
+    levels_trig = _get_val(result_row, "levels_triggered", "")
 
     triggered    = set(rules_trig.replace(" ", "").split(","))
     show_ban     = bool(_IB_INSTANT & triggered)
     if not show_ban and "EMAIL_BLOCKED" in triggered:
         show_ban = int(result_row.get("_r03_score", 0) or 0) == 100
-    if show_ban:
-        fired_ib = (_IB_INSTANT | {"EMAIL_BLOCKED"}) & triggered
-        labels   = ", ".join(_IB_LABELS.get(r, r) for r in sorted(fired_ib))
-        blocks.append({"type": "section", "text": {"type": "mrkdwn",
-            "text": f"*!! INSTANT BAN !!*  {labels}"}})
+
+    risk_emoji  = _RISK_EMOJI.get(risk_level, "")
+    ban_label   = " ⚡ INSTANT BLOCK" if show_ban else ""
+    color  = _EVENT_COLORS.get(event_type, "#95a5a6")
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "emoji": True,
+                                    "text": f"{risk_emoji} {risk_level}{ban_label} — {short_event}"}},
+    ]
+    fields = _id_fields()
+    if fields:
+        blocks.append({"type": "section", "fields": fields})
 
     blocks.append({"type": "actions", "elements": [{
         "type":      "button",
@@ -455,6 +452,45 @@ def _build_slack_blocks(
             "deny":    {"type": "plain_text", "text": "Cancel"},
         },
     }]})
+
+    blocks.append({"type": "divider"})
+    blocks.append({"type": "section", "text": {"type": "mrkdwn",
+        "text": f"*Risk Score:* {risk_score}  |  *Flags:* {flag_count}"}})
+
+    if reason_sum:
+        reasons = reason_sum.split(" | ")
+        levels  = [l.strip() for l in levels_trig.split(",") if l.strip()]
+        rules   = [r.strip() for r in rules_trig.split(",") if r.strip()]
+        lines = []
+        for i, (r, lvl, rule) in enumerate(
+            zip(reasons, levels + [""] * len(reasons), rules + [""] * len(reasons)), 1
+        ):
+            if rule in (_IB_INSTANT | {"EMAIL_BLOCKED"}):
+                text = f"*{r.upper()}*"
+            elif lvl == "HIGH":
+                text = f"*{r}*"
+            elif lvl == "MEDIUM":
+                text = f"_{r}_"
+            else:
+                text = r
+            lines.append(f"{i}. {text}")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+            "text": "\n".join(lines)}})
+
+    matched_cid, matched_url = _matched_blocked_url(result_row)
+    explanation = _match_explanation(result_row, tx_row)
+    if matched_cid:
+        link       = f"<{matched_url}|{matched_cid[:8]}...>" if matched_url else matched_cid
+        match_text = f"*Matched blocked user:* {link}"
+        if explanation:
+            match_text += f"\n*Match:* {explanation}"
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": match_text}})
+
+    if show_ban:
+        fired_ib = (_IB_INSTANT | {"EMAIL_BLOCKED"}) & triggered
+        labels   = ", ".join(_IB_LABELS.get(r, r) for r in sorted(fired_ib))
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+            "text": f"*!! INSTANT BAN !!*  {labels}"}})
 
     return color, blocks
 

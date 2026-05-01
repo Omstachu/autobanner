@@ -424,6 +424,21 @@ def _build_lookup_structures(blocked_df: pd.DataFrame) -> dict:
     ctx["blocked_tokens"] = set(blocked_df.get("card_token", pd.Series()).dropna().str.strip())
     ctx["blocked_ips"]    = set(blocked_df.get("card_ip",    pd.Series()).dropna().str.strip())
 
+    token_to_cid: dict = {}
+    ip_to_cid: dict = {}
+    for _, brow in blocked_df.iterrows():
+        cid = str(brow.get("customer_id", "")).strip()
+        if not cid:
+            continue
+        tok = str(brow.get("card_token", "") or "").strip()
+        if tok:
+            token_to_cid.setdefault(tok, cid)
+        ip = str(brow.get("card_ip", "") or "").strip()
+        if ip:
+            ip_to_cid.setdefault(ip, cid)
+    ctx["blocked_token_to_cid"] = token_to_cid
+    ctx["blocked_ip_to_cid"]    = ip_to_cid
+
     emails = pd.concat([
         blocked_df.get("card_email",    pd.Series()).dropna(),
         blocked_df.get("customer_email", pd.Series()).dropna(),
@@ -904,10 +919,14 @@ def _precompute_vectorized(df: pd.DataFrame, blocked_df: pd.DataFrame,
     )
 
     # Rule 8: card token
-    df["_r08_flag"] = df["card_token"].fillna("").str.strip().isin(ctx["blocked_tokens"])
+    _tokens = df["card_token"].fillna("").str.strip()
+    df["_r08_flag"]        = _tokens.isin(ctx["blocked_tokens"])
+    df["_r08_matched_cid"] = _tokens.map(ctx.get("blocked_token_to_cid", {})).fillna("")
 
     # Rule 9: IP
-    df["_r09_flag"] = df["card_ip"].fillna("").str.strip().isin(ctx["blocked_ips"])
+    _ips = df["card_ip"].fillna("").str.strip()
+    df["_r09_flag"]        = _ips.isin(ctx["blocked_ips"])
+    df["_r09_matched_cid"] = _ips.map(ctx.get("blocked_ip_to_cid", {})).fillna("")
 
     # Rule 10: city mismatch (exact first, fuzzy passthrough for abbreviations)
     card_city = df["card_city"].fillna("").str.strip().str.lower()
