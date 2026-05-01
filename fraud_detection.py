@@ -11,6 +11,7 @@ Phase 2: Score every transaction against 17 weighted rules and write results.
 import argparse
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from enum import IntEnum
@@ -348,6 +349,76 @@ def _norm_email(s: str) -> str:
 
 def _norm_str(s: str) -> str:
     return str(s).strip() if s and not pd.isna(s) else ""
+
+
+def _normalize_name(s) -> str:
+    """Lowercase, strip whitespace, drop diacritics. 'José' → 'jose'."""
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return ""
+    s = str(s).strip().lower()
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s
+
+
+def _name_tokens(name: str) -> frozenset:
+    """Whitespace-split into a token set. Hyphens stay intact (`garcia-lopez` is one token)."""
+    return frozenset(t for t in name.split() if t)
+
+
+def _cluster_names(names) -> list:
+    """
+    Cluster a list of normalized names by token-subset relation.
+    Two names are the same identity if one's token set is a subset of the other's,
+    provided the smaller set has ≥2 tokens (single-token names like 'noel' don't subset-match).
+
+    Returns a list of clusters; each cluster is a list of names sorted longest-first
+    so the first element is the canonical representative. Output order is deterministic.
+
+    Accepted false negative: 'jose maria garcia' clusters with 'maria garcia' because
+    {maria, garcia} ⊆ {jose, maria, garcia}. Rare in practice; tradeoff for the much
+    more common middle-name and Hispanic two-surname (paternal+maternal) patterns.
+    """
+    unique = sorted({n for n in names if n})
+    n = len(unique)
+    if n <= 1:
+        return [[unique[0]]] if n == 1 else []
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    toks = [_name_tokens(n) for n in unique]
+    for i in range(n):
+        ti = toks[i]
+        if len(ti) < 2:
+            continue
+        for j in range(i + 1, n):
+            tj = toks[j]
+            if len(tj) < 2:
+                continue
+            if ti <= tj or tj <= ti:
+                union(i, j)
+
+    groups: dict = {}
+    for i, name in enumerate(unique):
+        groups.setdefault(find(i), []).append(name)
+
+    # Canonical: longest name first; sort clusters by their representative for determinism.
+    clusters = [sorted(g, key=lambda x: (-len(x), x)) for g in groups.values()]
+    clusters.sort(key=lambda c: c[0])
+    return clusters
 
 
 def _email_local(email: str) -> str:
@@ -738,15 +809,8 @@ def rule_16_multiple_card_names(row: pd.Series, **_) -> list:
         return []
     first = _norm_str(row.get("card_first_name", ""))
     last  = _norm_str(row.get("card_last_name", ""))
-    this_name = f"{first} {last}".strip().lower()
 
-    others: list = []
-    for name in str(row.get("_r16_all_names", "")).split("|||"):
-        name = name.strip()
-        if name and name != this_name and name not in others:
-            others.append(name)
-        if len(others) >= 4:
-            break
+    others = [n for n in str(row.get("_r16_cluster_reps_other", "")).split("|||") if n][:4]
 
     if others:
         others_str = ", ".join(n.title() for n in others)
@@ -992,22 +1056,41 @@ def _precompute_vectorized(df: pd.DataFrame, blocked_df: pd.DataFrame,
     else:
         df["_r15_first_nonstandard"] = ~df["total_cents"].isin(VALID_AMOUNTS)
 
-    # Rule 16: multiple distinct card names per customer
+    # Rule 16: multiple distinct card names per customer.
+    # Names are clustered by token-subset relation so middle-name additions and
+    # Hispanic two-surname patterns don't fire the rule (see _cluster_names).
     if "customer_id" in df.columns:
-        name_str = (
-            df["card_first_name"].fillna("").str.strip() + " " +
-            df["card_last_name"].fillna("").str.strip()
-        ).str.strip().str.lower()
-        df["_full_name_tmp"] = name_str
-        df["_r16_flag"] = df.groupby("customer_id")["_full_name_tmp"].transform("nunique") > 1
-        # Store all unique names per customer as |||‑separated string for display in reason text
-        df["_r16_all_names"] = df.groupby("customer_id")["_full_name_tmp"].transform(
-            lambda s: "|||".join(sorted(s.unique()))
-        )
+        df["_full_name_tmp"] = (
+            df["card_first_name"].apply(_normalize_name) + " " +
+            df["card_last_name"].apply(_normalize_name)
+        ).str.strip()
 
-        # Gender switch: customer uses both male-coded and female-coded names
+        per_cust = df.groupby("customer_id")["_full_name_tmp"].agg(
+            lambda s: _cluster_names(list(s.unique()))
+        )
+        cust_to_clusters = per_cust.to_dict()
+
+        df["_r16_flag"] = df["customer_id"].map(
+            lambda cid: len(cust_to_clusters.get(cid, [])) > 1
+        ).fillna(False).astype(bool)
+
+        def _other_reps(cid: str, this_name: str) -> str:
+            clusters = cust_to_clusters.get(cid, [])
+            if len(clusters) <= 1:
+                return ""
+            this_rep = next((c[0] for c in clusters if this_name in c), this_name)
+            return "|||".join(c[0] for c in clusters if c[0] != this_rep)
+
+        df["_r16_cluster_reps_other"] = [
+            _other_reps(cid, name)
+            for cid, name in zip(df["customer_id"], df["_full_name_tmp"])
+        ]
+
+        # Gender switch: customer uses both male-coded and female-coded names.
+        # Still gated on _r16_flag, so customers whose names cluster into one
+        # identity also stop firing GENDER_SWITCH (correct: same first name).
         if female_names:
-            first_lower = df["card_first_name"].fillna("").str.strip().str.lower()
+            first_lower = df["card_first_name"].apply(_normalize_name)
             df["_name_female_tmp"] = first_lower.isin(female_names)
             any_female = df.groupby("customer_id")["_name_female_tmp"].transform("any")
             all_female = df.groupby("customer_id")["_name_female_tmp"].transform("all")
@@ -1022,7 +1105,7 @@ def _precompute_vectorized(df: pd.DataFrame, blocked_df: pd.DataFrame,
     else:
         df["_r16_flag"] = False
         df["_r16_gender_switch"] = False
-        df["_r16_all_names"] = ""
+        df["_r16_cluster_reps_other"] = ""
 
     return df
 

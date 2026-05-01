@@ -271,7 +271,7 @@ All columns are loaded as strings initially, then coerced to the correct types i
 | IP_FRAUD_CODE_ZERO_ACCEPT | `card_ip`, `auth_codes`, `transaction_status` | IP matches blocked user AND customer has 0% acceptance with auth 59/83 | HIGH (weight 100) |
 | GEO_RISK / GEO_RISK_IP | `card_city`, `card_ip_city` | City in risky list (fuzzy match at 85%); IP city weighted slightly higher (15 vs 10) | LOW |
 | AMOUNT_FLAG | `total_cents` | 99¢ ending → LOW; non-standard amount on first transaction → LOW; >$100 → FLAG_LOW; >$200 → LOW; >$500 → MEDIUM; >$1000 → MEDIUM ("extremely large"); large FAILED >$500 → LOW | FLAG_LOW → MEDIUM |
-| MULTIPLE_CARD_NAMES | `card_first_name`, `card_last_name` | Customer uses more than one distinct full name across transactions | HIGH (weight 150) |
+| MULTIPLE_CARD_NAMES | `card_first_name`, `card_last_name` | Customer uses more than one distinct full name across transactions; names that are token-subsets of each other are clustered as one identity (so middle-name additions and Hispanic two-surname patterns don't fire) | HIGH (weight 150) |
 | GENDER_SWITCH | `card_first_name`, `card_last_name` | Card names switch between female and male across transactions (sub-flag of MULTIPLE_CARD_NAMES) | MEDIUM |
 | EMAIL_NAME_MISMATCH | `card_email`, `card_first_name`, `card_last_name` | Email local part looks name-formatted but doesn't fuzzy-match the card name at ≥75% | LOW |
 
@@ -323,7 +323,7 @@ Use `AUTH_CODE_RISK_OVERRIDE` and `AUTH_CODE_SCORE_OVERRIDE` dicts to tune indiv
 
 - Fuzzy matching rules (EMAIL_BLOCKED, NAME_BLOCKED, STREET_BLOCKED) use `rapidfuzz.process.extractOne` called once per row — adequate for tens of thousands of rows.
 - Rule 13 (FAILED_PATTERNS) uses `groupby("customer_id").apply()` to analyze per-customer transaction history. pandas drops the groupby key from the result; it is restored explicitly after the apply.
-- MULTIPLE_CARD_NAMES and gender switch detection use `groupby.transform("nunique")` / `transform("any")` — fully vectorized.
+- MULTIPLE_CARD_NAMES clusters each customer's names by token-subset relation (`_cluster_names()`) — `noel ramirez` ⊆ `noel prada ramirez` is one identity. Single-token names (e.g. just `noel`) don't subset-match. Diacritics are stripped (`josé` ≡ `jose`); hyphenated surnames stay one token. Gender switch detection still uses `groupby.transform("any")` and is gated on the cluster-based `_r16_flag`.
 - All other rules use vectorized pandas operations.
 
 ## Female name detection

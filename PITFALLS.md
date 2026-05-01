@@ -65,6 +65,16 @@ In `fetch_and_score.py`, history is loaded from the local payments CSV (auto-det
 
 ---
 
+## MULTIPLE_CARD_NAMES Tolerates Middle Names and Two-Surname Patterns
+
+The rule clusters a customer's distinct names by token-subset relation: if one name's whitespace tokens are a subset of another's (and the smaller has ≥2 tokens), they're treated as the same identity. So `noel ramirez` and `noel prada ramirez` cluster into one identity and don't fire — same for married/maiden cases like `mary smith` and `mary smith jones`.
+
+Accepted false negative: `jose maria garcia` clusters with `maria garcia` because `{maria, garcia} ⊆ {jose, maria, garcia}`. Rare in practice; the tradeoff is worth the much more common middle-name and Hispanic two-surname (paternal+maternal) patterns.
+
+Single-token names like a bare `noel` do **not** subset-match into `noel ramirez` — a fraudster can't bypass the rule by submitting one transaction with only a first name.
+
+---
+
 ## build_blocked_list.py Scores Customers Chronologically
 
 When seeding `blocked_users.csv`, each blocked customer is scored only against customers who were blocked *before* them (sorted by `transaction_created_at`). This prevents self-matching (a customer can't match themselves) but means the `reason_summary` for early customers in the timeline may be weaker than for later ones who have more blocked users to match against.
