@@ -113,6 +113,12 @@ Three tables, created automatically by `db.init_db()` on server startup:
 
 `db.py` exposes typed CRUD functions used by `webhook_server.py`, `download_payments.py`, and `build_blocked_list.py`. The batch scoring script (`fraud_detection.py`) still reads from local CSV files.
 
+### Querying the DB from Claude Code
+
+A read-only Postgres MCP server is wired up via `.mcp.json` at the repo root. When Claude Code starts a session in this directory it spawns [`crystaldba/postgres-mcp`](https://github.com/crystaldba/postgres-mcp) (via `uvx`, pinned to Python 3.12) in `--access-mode=restricted`, pointed at `${DATABASE_URL}` (with the SQLAlchemy `+psycopg2` suffix stripped at launch). Claude can then answer ad-hoc data questions ("how many customers had auth code 886 then later used a US-BIN card?") by writing SQL itself — no need to drop into `analyze.py` for one-off lookups. Restricted mode means only `SELECT` queries are allowed. See `potential_upgrades.md` for follow-ups.
+
+Requires `uv` on the local machine (`brew install uv`).
+
 ## blocked_users.csv / blocked_users table
 
 The live reference used by every scoring run. One row per known-bad customer.
