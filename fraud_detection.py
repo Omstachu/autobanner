@@ -180,7 +180,7 @@ RULE_WEIGHTS: dict = {
     ("MULTIPLE_CARD_NAMES",       "HIGH"):   150,  # multiple identities on one account — very hard to have legitimately
     ("GENDER_SWITCH",             "MEDIUM"): 50,   # sub-signal of MULTIPLE_CARD_NAMES; weaker in isolation
     ("FRAUD_CODE_ZERO_ACCEPT",    "HIGH"):   100,  # 59/83 + 0% acceptance rate + 3+ transactions
-    ("MULTI_NAME_LOW_ACCEPT",     "HIGH"):   150,  # multiple names + <50% acceptance + 3+ transactions
+    ("MULTI_NAME_LOW_ACCEPT",     "HIGH"):   150,  # multiple names + <50% acceptance + 2+ transactions
     ("IP_FRAUD_CODE_ZERO_ACCEPT", "HIGH"):   100,  # IP match + 59/83 + 0% acceptance
     ("FEMALE_NAME",               "MEDIUM"): 50,
 
@@ -849,7 +849,7 @@ def _analyze_customer_failures(group: pd.DataFrame) -> pd.DataFrame:
                 "FRAUD_CODE_ZERO_ACCEPT", RiskLevel.HIGH,
                 f"Auth code 59/83 present with 0% acceptance rate ({n_hist} transactions)",
             ))
-        if n_hist >= 3 and bool(r16_flags[i]) and accept_rate < 0.5:
+        if n_hist >= 2 and bool(r16_flags[i]) and accept_rate < 0.5:
             row_results.append(RuleResult(
                 "MULTI_NAME_LOW_ACCEPT", RiskLevel.HIGH,
                 f"Multiple card names with {int(accept_rate * 100)}% acceptance rate ({n_hist} transactions)",

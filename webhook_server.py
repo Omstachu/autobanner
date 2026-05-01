@@ -25,6 +25,7 @@ Optional .env:
 import argparse
 import hashlib
 import hmac
+import json
 import os
 import sys
 import threading
@@ -83,12 +84,27 @@ _C = _THEMES.get(COLOR_THEME, _THEMES["default"])
 def _risk_color(level: str) -> str:
     return {"HIGH": _C["red"], "MEDIUM": _C["yellow"], "LOW": _C["cyan"], "FLAG_LOW": _C["dim"]}.get(level, "")
 
+_SLACK_COLORS = {
+    "HIGH":     "#e74c3c",
+    "MEDIUM":   "#e67e22",
+    "LOW":      "#3498db",
+    "FLAG_LOW": "#95a5a6",
+    "clean":    "#2ecc71",
+}
+
+def _slack_color(level: str) -> str:
+    return _SLACK_COLORS.get(level, _SLACK_COLORS["clean"])
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 COINFLOW_API_URL         = os.getenv("COINFLOW_API_URL", "https://api.coinflow.cash/api")
 COINFLOW_API_KEY         = os.getenv("COINFLOW_API_KEY", "")
 COINFLOW_VALIDATION_KEY  = os.getenv("COINFLOW_VALIDATION_KEY", "")
 WEBHOOK_PATH_TOKEN       = os.getenv("WEBHOOK_PATH_TOKEN", "")
+
+SLACK_BOT_TOKEN      = os.getenv("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL_ID     = os.getenv("SLACK_CHANNEL_ID", "")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 
 BLOCKED_LIST_PATH = "blocked_users.csv"  # kept for log messages only
 
@@ -99,6 +115,20 @@ INSTANT_BLOCK_RULES = {
 }
 
 HANDLED_EVENT_TYPES = {"Settled", "Card Payment Authorized", "Card Payment Declined"}
+
+_IB_INSTANT = {
+    "IP_BLOCKED", "TOKEN_BLOCKED", "AUTH_CODES_INSTANT",
+    "FRAUD_CODE_ZERO_ACCEPT", "MULTI_NAME_LOW_ACCEPT", "IP_FRAUD_CODE_ZERO_ACCEPT",
+}
+_IB_LABELS = {
+    "AUTH_CODES_INSTANT":        "Flagged auth code",
+    "TOKEN_BLOCKED":             "Card token matched blocked user",
+    "EMAIL_BLOCKED":             "Email matched blocked user",
+    "IP_BLOCKED":                "IP matched blocked user",
+    "FRAUD_CODE_ZERO_ACCEPT":    "Auth code 59/83 with 0% acceptance rate",
+    "MULTI_NAME_LOW_ACCEPT":     "Multiple card names with low acceptance rate",
+    "IP_FRAUD_CODE_ZERO_ACCEPT": "IP match with 59/83 and 0% acceptance rate",
+}
 
 # ── Server state ───────────────────────────────────────────────────────────────
 
@@ -291,18 +321,7 @@ def _print_result(
         if explanation:
             print(f"  Match:     {explanation}")
 
-    _IB_LABELS = {
-        "AUTH_CODES_INSTANT":        "Flagged auth code",
-        "TOKEN_BLOCKED":             "Card token matched blocked user",
-        "EMAIL_BLOCKED":             "Email matched blocked user",
-        "IP_BLOCKED":                "IP matched blocked user",
-        "FRAUD_CODE_ZERO_ACCEPT":    "Auth code 59/83 with 0% acceptance rate",
-        "MULTI_NAME_LOW_ACCEPT":     "Multiple card names with low acceptance rate",
-        "IP_FRAUD_CODE_ZERO_ACCEPT": "IP match with 59/83 and 0% acceptance rate",
-    }
-    triggered   = set(rules_trig.replace(" ", "").split(","))
-    _IB_INSTANT = {"IP_BLOCKED", "TOKEN_BLOCKED", "AUTH_CODES_INSTANT",
-                   "FRAUD_CODE_ZERO_ACCEPT", "MULTI_NAME_LOW_ACCEPT", "IP_FRAUD_CODE_ZERO_ACCEPT"}
+    triggered    = set(rules_trig.replace(" ", "").split(","))
     _show_banner = bool(_IB_INSTANT & triggered)
     if not _show_banner and "EMAIL_BLOCKED" in triggered:
         _show_banner = int(result_row.get("_r03_score", 0) or 0) == 100
@@ -314,6 +333,130 @@ def _print_result(
         print(f"{color}  Reason: {labels}{R}")
 
     print(f"{color}{SEP}{R}")
+
+
+# ── Slack Block Kit builder ────────────────────────────────────────────────────
+
+_ET_SHORT = {
+    "Settled":                  "Settled",
+    "Card Payment Authorized":  "Authorized",
+    "Card Payment Declined":    "Declined",
+}
+
+
+def _build_slack_blocks(
+    event_type: str,
+    tx_df: pd.DataFrame,
+    result_df: pd.DataFrame,
+    success_rate: int | None = None,
+    txn_count: int = 0,
+    is_verified: bool = False,
+) -> tuple[str, list]:
+    """Return (color, blocks) for a Slack attachments message."""
+    tx_row      = tx_df.iloc[0]
+    payment_id  = _get_val(tx_row, "payment_id")
+    customer_id = _get_val(tx_row, "customer_id")
+    amount      = _format_amount(tx_row)
+    status      = _get_val(tx_row, "transaction_status")
+    cust_url    = _customer_url(customer_id)
+    first       = str(tx_row.get("card_first_name") or "").strip().title()
+    last        = str(tx_row.get("card_last_name")  or "").strip().title()
+    card_name   = f"{first} {last}".strip()
+    short_event = _ET_SHORT.get(event_type, event_type)
+
+    def _sr_text() -> str | None:
+        if success_rate is None or txn_count == 0:
+            return None
+        return f"{success_rate}% ({txn_count} txn{'s' if txn_count != 1 else ''})"
+
+    def _id_fields() -> list:
+        fields = []
+        name_str = f"*{card_name}*" + (" ⊕ Verified" if is_verified else "") if card_name else None
+        if name_str:
+            fields.append({"type": "mrkdwn", "text": f"*Name:* {name_str}"})
+        if amount:
+            fields.append({"type": "mrkdwn", "text": f"*Amount:* {amount} [{status}]"})
+        cid_text = f"<{cust_url}|{customer_id[:8]}...>" if cust_url else customer_id
+        if customer_id:
+            fields.append({"type": "mrkdwn", "text": f"*Customer:* {cid_text}"})
+        sr = _sr_text()
+        if sr:
+            fields.append({"type": "mrkdwn", "text": f"*History:* {sr}"})
+        return fields
+
+    # ── Clean path ─────────────────────────────────────────────────────────────
+    if result_df.empty:
+        color  = _slack_color("clean")
+        blocks: list = [
+            {"type": "header", "text": {"type": "plain_text",
+                                        "text": f"{short_event} — No fraud signals"}},
+        ]
+        fields = _id_fields()
+        if fields:
+            blocks.append({"type": "section", "fields": fields})
+        return color, blocks
+
+    # ── Flagged path ────────────────────────────────────────────────────────────
+    result_row  = result_df.iloc[0]
+    risk_level  = _get_val(result_row, "risk_level", "—")
+    risk_score  = _get_val(result_row, "risk_score", "0")
+    flag_count  = _get_val(result_row, "flag_count", "0")
+    reason_sum  = _get_val(result_row, "reason_summary", "")
+    rules_trig  = _get_val(result_row, "rules_triggered", "")
+
+    color  = _slack_color(risk_level)
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text",
+                                    "text": f"{risk_level} — {short_event}"}},
+    ]
+    fields = _id_fields()
+    if fields:
+        blocks.append({"type": "section", "fields": fields})
+
+    blocks.append({"type": "divider"})
+    blocks.append({"type": "section", "text": {"type": "mrkdwn",
+        "text": f"*Risk Score:* {risk_score}  |  *Flags:* {flag_count}"}})
+
+    if reason_sum:
+        lines = [f"{i}. {r}" for i, r in enumerate(reason_sum.split(" | "), 1)]
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+            "text": "\n".join(lines)}})
+
+    matched_cid, matched_url = _matched_blocked_url(result_row)
+    explanation = _match_explanation(result_row, tx_row)
+    if matched_cid:
+        link       = f"<{matched_url}|{matched_cid[:8]}...>" if matched_url else matched_cid
+        match_text = f"*Matched blocked user:* {link}"
+        if explanation:
+            match_text += f"\n*Match:* {explanation}"
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": match_text}})
+
+    triggered    = set(rules_trig.replace(" ", "").split(","))
+    show_ban     = bool(_IB_INSTANT & triggered)
+    if not show_ban and "EMAIL_BLOCKED" in triggered:
+        show_ban = int(result_row.get("_r03_score", 0) or 0) == 100
+    if show_ban:
+        fired_ib = (_IB_INSTANT | {"EMAIL_BLOCKED"}) & triggered
+        labels   = ", ".join(_IB_LABELS.get(r, r) for r in sorted(fired_ib))
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+            "text": f"*!! INSTANT BAN !!*  {labels}"}})
+
+    blocks.append({"type": "actions", "elements": [{
+        "type":      "button",
+        "text":      {"type": "plain_text", "text": "Block in Coinflow"},
+        "style":     "danger",
+        "action_id": "block_customer",
+        "value":     customer_id,
+        "confirm": {
+            "title":   {"type": "plain_text", "text": "Block customer?"},
+            "text":    {"type": "mrkdwn",
+                        "text": f"Block *{card_name or customer_id}* in Coinflow?"},
+            "confirm": {"type": "plain_text", "text": "Block"},
+            "deny":    {"type": "plain_text", "text": "Cancel"},
+        },
+    }]})
+
+    return color, blocks
 
 
 # ── Startup ────────────────────────────────────────────────────────────────────
@@ -352,6 +495,22 @@ def _load_state(skip_download: bool = False) -> None:
 
 
 # ── Signature verification ─────────────────────────────────────────────────────
+
+def _verify_slack_signature(raw_body: bytes, headers) -> bool:
+    if not SLACK_SIGNING_SECRET:
+        return True
+    ts  = headers.get("X-Slack-Request-Timestamp", "")
+    sig = headers.get("X-Slack-Signature", "")
+    if not ts or not sig:
+        return False
+    if abs(time.time() - float(ts)) > 300:
+        return False
+    base     = f"v0:{ts}:{raw_body.decode('utf-8')}"
+    expected = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode(), base.encode(), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
 
 def _verify_signature(raw_body: bytes, header_value: str | None) -> bool:
     """Verify a Coinflow-Signature header.
@@ -502,6 +661,46 @@ def _block_in_coinflow(customer_id: str) -> bool:
     except requests.exceptions.RequestException as exc:
         print(f"⚠  Coinflow block API error: {exc}")
         return False
+
+
+# ── Slack API ─────────────────────────────────────────────────────────────────
+
+def _post_to_slack(color: str, blocks: list) -> str | None:
+    """POST chat.postMessage. Returns message ts on success, None on failure."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID:
+        return None
+    try:
+        resp = requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": SLACK_CHANNEL_ID,
+                  "attachments": [{"color": color, "blocks": blocks}]},
+            timeout=10,
+        )
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"[slack] post failed: {data.get('error')}")
+            return None
+        return data.get("ts")
+    except Exception as exc:
+        print(f"[slack] error: {exc}")
+        return None
+
+
+def _update_slack_message(ts: str, color: str, blocks: list) -> None:
+    """POST chat.update to replace a message's blocks in-place."""
+    if not SLACK_BOT_TOKEN or not SLACK_CHANNEL_ID or not ts:
+        return
+    try:
+        requests.post(
+            "https://slack.com/api/chat.update",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json={"channel": SLACK_CHANNEL_ID, "ts": ts,
+                  "attachments": [{"color": color, "blocks": blocks}]},
+            timeout=10,
+        )
+    except Exception as exc:
+        print(f"[slack] update error: {exc}")
 
 
 # ── Hourly background refresh ──────────────────────────────────────────────────
@@ -656,6 +855,15 @@ def webhook(token: str) -> tuple:
     _print_result(event_type, tx_df, new_result,
                   success_rate=success_rate, txn_count=total_txns, is_verified=is_verified)
 
+    slack_ts    = None
+    slack_color = None
+    slack_blocks_orig: list = []
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+        slack_color, slack_blocks_orig = _build_slack_blocks(
+            event_type, tx_df, new_result, success_rate, total_txns, is_verified
+        )
+        slack_ts = _post_to_slack(slack_color, slack_blocks_orig)
+
     if new_result.empty:
         return jsonify({"status": "ok"}), 200
 
@@ -688,8 +896,46 @@ def webhook(token: str) -> tuple:
             print(f"⚠  Blocked in Coinflow: {cid_to_block}")
         else:
             print(f"⚠  Coinflow block API call failed for {cid_to_block} — block manually")
+        if slack_ts and slack_color:
+            status_text = "Auto-blocked in Coinflow" if blocked_ok else "Auto-block API failed — block manually"
+            updated = [b for b in slack_blocks_orig if b.get("type") != "actions"]
+            updated.append({"type": "context",
+                             "elements": [{"type": "mrkdwn", "text": status_text}]})
+            _update_slack_message(slack_ts, slack_color, updated)
 
     return jsonify({"status": "ok"}), 200
+
+
+@app.route("/slack/actions", methods=["POST"])
+def slack_actions() -> tuple:
+    raw_body = request.get_data()
+    if not _verify_slack_signature(raw_body, request.headers):
+        return jsonify({"error": "invalid signature"}), 401
+
+    payload = json.loads(request.form.get("payload", "{}"))
+    action  = (payload.get("actions") or [{}])[0]
+    msg_ts  = payload.get("message", {}).get("ts", "")
+    user    = payload.get("user", {}).get("name", "unknown")
+
+    if action.get("action_id") == "block_customer":
+        customer_id = action.get("value", "")
+        blocked_ok  = _block_in_coinflow(customer_id)
+        status_text = (
+            f"Blocked in Coinflow by @{user}"
+            if blocked_ok else
+            f"Block API failed — block manually (@{user} attempted)"
+        )
+        attachments     = payload.get("message", {}).get("attachments") or [{}]
+        orig_color      = attachments[0].get("color", _SLACK_COLORS["clean"])
+        original_blocks = attachments[0].get("blocks", [])
+        updated_blocks  = [b for b in original_blocks if b.get("type") != "actions"]
+        updated_blocks.append({
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": status_text}],
+        })
+        _update_slack_message(msg_ts, orig_color, updated_blocks)
+
+    return "", 200
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
