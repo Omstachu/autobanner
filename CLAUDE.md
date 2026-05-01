@@ -70,6 +70,7 @@ build_blocked_list.py    Seed or update blocked_users table from DB or a local p
 build_female_names.py    Preprocesses SSA baby name files → female_names.csv
 add_verified_customer.py Add a customer to the verified_customers DB table by payment ID
 send_test_webhook.py     Send a signed test webhook to the local server or Cloud Run (--url flag for remote)
+analyze.py               Ad-hoc query workspace — `python -i analyze.py` loads payments/blocked/verified into pandas for exploration
 db.py                    PostgreSQL data access layer — schema init, CRUD for payments/blocked_users/verified_customers
 webhook_server.py        Real-time webhook server — scores each incoming payment, auto-blocks instant-ban matches via Coinflow API
 seed_payments.py         One-time migration: load payments/ CSV into the DB (delete after use)
@@ -115,7 +116,7 @@ Three tables, created automatically by `db.init_db()` on server startup:
 
 ### Querying the DB from Claude Code
 
-A read-only Postgres MCP server is wired up via `.mcp.json` at the repo root. When Claude Code starts a session in this directory it spawns [`crystaldba/postgres-mcp`](https://github.com/crystaldba/postgres-mcp) (via `uvx`, pinned to Python 3.12) in `--access-mode=restricted`, pointed at `${DATABASE_URL}` (with the SQLAlchemy `+psycopg2` suffix stripped at launch). Claude can then answer ad-hoc data questions ("how many customers had auth code 886 then later used a US-BIN card?") by writing SQL itself — no need to drop into `analyze.py` for one-off lookups. Restricted mode means only `SELECT` queries are allowed. See `potential_upgrades.md` for follow-ups.
+A read-only Postgres MCP server is wired up via `.mcp.json` at the repo root. When Claude Code starts a session in this directory it spawns [`crystaldba/postgres-mcp`](https://github.com/crystaldba/postgres-mcp) (via `uvx`, pinned to Python 3.12 because `pglast` has no wheels for 3.13+) in `--access-mode=restricted` (only `SELECT` is allowed), pointed at `${DATABASE_URL}` with the SQLAlchemy `postgresql+psycopg2:` scheme rewritten to plain `postgresql:` at launch. Use the MCP for pure SQL questions — Claude can write the query itself. Use `analyze.py` when the answer needs pandas/numpy on top of the rows. See `potential_upgrades.md` for follow-ups.
 
 Requires `uv` on the local machine (`brew install uv`).
 
