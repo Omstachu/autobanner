@@ -453,7 +453,7 @@ def _build_slack_blocks(
         "text":      {"type": "plain_text", "text": "Block user"},
         "style":     "danger",
         "action_id": "block_customer",
-        "value":     json.dumps({"cid": customer_id, "pid": payment_id}),
+        "value":     _pack_btn_value(customer_id, payment_id),
         "confirm": {
             "title":   {"type": "plain_text", "text": "Block customer?"},
             "text":    {"type": "mrkdwn",
@@ -714,7 +714,7 @@ def _block_in_backoffice(payment_id: str) -> bool:
     if not payment_id or not BACKOFFICE_API_KEY:
         return False
     url     = f"{BACKOFFICE_API_URL}/external/fraud/ban-by-payment-id"
-    body    = {"payment_id": payment_id.replace("-", "")}
+    body    = {"payment_id": _norm_id(payment_id)}
     headers = {"Authorization": BACKOFFICE_API_KEY, "Content-Type": "application/json"}
     last_err: str | None = None
     for delay in (0, 0.5, 1.0):
@@ -734,10 +734,39 @@ def _block_in_backoffice(payment_id: str) -> bool:
     return False
 
 
-def _block_status_text(coinflow_ok: bool, backoffice_ok: bool, *, auto: bool = False, suffix: str = "") -> str:
-    """Single line summarizing the outcome of the two block calls, for Slack context block."""
+_BTN_CID_KEY = "cid"
+_BTN_PID_KEY = "pid"
+
+
+def _pack_btn_value(customer_id: str, payment_id: str) -> str:
+    return json.dumps({_BTN_CID_KEY: customer_id, _BTN_PID_KEY: payment_id})
+
+
+def _unpack_btn_value(raw: str) -> tuple[str, str]:
+    """Return (customer_id, payment_id). Legacy buttons (posted before this schema change) carried
+    a plain customer_id string with no payment_id — fall back to (raw, '') for those."""
+    if not raw:
+        return "", ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw, ""
+    return str(data.get(_BTN_CID_KEY, "") or ""), str(data.get(_BTN_PID_KEY, "") or "")
+
+
+def _block_status_text(coinflow_ok: bool, backoffice_ok: bool | None, *, auto: bool = False, suffix: str = "") -> str:
+    """Single line summarizing the outcome of the two block calls, for Slack context block.
+
+    backoffice_ok=None means the back-office call wasn't attempted (e.g. legacy Slack button
+    that predates the schema change and carried no payment_id).
+    """
     blocked = "Auto-blocked" if auto else "Blocked"
-    if coinflow_ok and backoffice_ok:
+    if backoffice_ok is None:
+        if coinflow_ok:
+            body = f"❌ {blocked} in Coinflow — back-office not attempted (legacy alert; re-trigger from a fresh alert to ban there)"
+        else:
+            body = "⚠️ Coinflow block failed — block manually (back-office not attempted, legacy alert)"
+    elif coinflow_ok and backoffice_ok:
         body = f"❌ {blocked} in Coinflow + back office"
     elif coinflow_ok and not backoffice_ok:
         body = f"❌ {blocked} in Coinflow — ⚠️ back-office failed, block manually"
@@ -969,8 +998,8 @@ def webhook(token: str) -> tuple:
         reason_summary = _get_val(result_row, "reason_summary")
         with _lock:
             added = _append_to_blocked_list(tx_df, reason_summary)
-        cid_to_block = str(tx_df.iloc[0].get("customer_id", "")).strip()
-        pid_to_block = _norm_id(str(tx_df.iloc[0].get("payment_id", "")))
+        cid_to_block  = str(tx_df.iloc[0].get("customer_id", "")).strip()
+        pid_to_block  = str(tx_df.iloc[0].get("payment_id", ""))
         blocked_ok    = _block_in_coinflow(cid_to_block)
         backoffice_ok = _block_in_backoffice(pid_to_block)
         fired_str     = ", ".join(sorted(fired_instant))
@@ -1009,20 +1038,10 @@ def slack_actions() -> tuple:
     user    = payload.get("user", {}).get("name", "unknown")
 
     if action.get("action_id") == "block_customer":
-        raw_value = action.get("value", "") or ""
-        try:
-            data = json.loads(raw_value) if raw_value else {}
-            customer_id = str(data.get("cid", "") or "")
-            payment_id  = str(data.get("pid", "") or "")
-        except json.JSONDecodeError:
-            # Legacy buttons (posted before the back-office change) carried the customer_id as a plain string.
-            customer_id = raw_value
-            payment_id  = ""
+        customer_id, payment_id = _unpack_btn_value(action.get("value", ""))
         blocked_ok    = _block_in_coinflow(customer_id)
-        backoffice_ok = _block_in_backoffice(payment_id)
+        backoffice_ok = _block_in_backoffice(payment_id) if payment_id else None
         status_text   = _block_status_text(blocked_ok, backoffice_ok, suffix=f" by @{user}")
-        if not payment_id:
-            status_text += " — back-office not called (legacy alert; re-trigger from a fresh alert to ban there)"
         attachments     = payload.get("message", {}).get("attachments") or [{}]
         orig_color      = attachments[0].get("color", _SLACK_COLORS["clean"])
         original_blocks = attachments[0].get("blocks", [])
