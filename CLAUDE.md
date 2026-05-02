@@ -96,11 +96,14 @@ COINFLOW_API_KEY=your_api_key_here
 COINFLOW_API_URL=https://api.coinflow.cash/api    # optional — defaults to prod
 COINFLOW_VALIDATION_KEY=...                       # from Coinflow dashboard → Developers → Webhooks
 DATABASE_URL=postgresql+psycopg2://user:pass@host/dbname
+BACKOFFICE_API_KEY=...                            # Icebox back-office ban auth token
+BACKOFFICE_API_URL=https://icyboxdev.infiniteedgers.com/api   # optional — defaults to prod (`icybox.api.infiniteedgers.com/api`)
 ```
 
 - `COINFLOW_API_KEY` — required by `fetch_and_score.py`, `download_payments.py`, `block_customer.py`, and `webhook_server.py`
 - `COINFLOW_VALIDATION_KEY` — required to verify webhook signatures; if unset, signature verification is disabled
 - `DATABASE_URL` — required by `webhook_server.py`, `download_payments.py`, `build_blocked_list.py`, and the seed scripts; batch scoring (`fraud_detection.py`) reads from local CSV files and does not need it
+- `BACKOFFICE_API_KEY` — required by `webhook_server.py` to mirror bans into Icebox (back office). If unset, the back-office call short-circuits silently and only Coinflow is hit.
 
 ## PostgreSQL schema (`db.py`)
 
@@ -169,7 +172,7 @@ Real-time scoring server. On each incoming webhook:
 3. Loads customer transaction history from DB
 4. Scores the payment through the same 21-rule engine as the batch script
 5. Prints results to the terminal with color-coded output
-6. If instant-ban rules fire: appends to `blocked_users` DB table and calls `PUT /merchant/blocked/{id}` to block in Coinflow
+6. If instant-ban rules fire: appends to `blocked_users` DB table, calls `PUT /merchant/blocked/{id}` to block in Coinflow, **and** `POST /external/fraud/ban-by-payment-id` to block in the Icebox back office (independent calls — either can fail without affecting the other)
 
 **Terminal output includes:**
 - Payment ID, customer name + dashboard link, amount, transaction status
@@ -190,7 +193,9 @@ Real-time scoring server. On each incoming webhook:
 | `MULTI_NAME_LOW_ACCEPT` | Multiple card names + <50% acceptance + ≥3 transactions |
 | `IP_FRAUD_CODE_ZERO_ACCEPT` | IP matches blocked user + auth 59/83 + 0% acceptance |
 
-When any of these fires, the server calls `_block_in_coinflow(customer_id)` which calls `PUT /merchant/blocked/{id}` via the Coinflow API. If the API call fails, a warning is printed but the server continues normally.
+When any of these fires, the server calls `_block_in_coinflow(customer_id)` (Coinflow `PUT /merchant/blocked/{id}`) **and** `_block_in_backoffice(payment_id)` (Icebox `POST /external/fraud/ban-by-payment-id`). The back-office call retries up to 3 times on transient errors (timeouts, connection errors, 5xx) with 0.5s/1s backoff; 4xx errors fail fast without retry. If either API fails, a warning is printed but the server continues normally. The Slack message attached to the alert is updated with a context block summarizing both outcomes.
+
+The same pair of calls fires when a Slack reviewer clicks the "Block user" button on an alert. The button's `value` field carries `{"cid": customer_id, "pid": payment_id}` JSON-encoded so the action handler has both IDs.
 
 **State management**: All state (payment history, blocked users, verified customers) is loaded from PostgreSQL on startup via `db.load_*()` functions and refreshed hourly in a background thread.
 
@@ -371,6 +376,9 @@ All secrets are stored in Secret Manager under project `coinflow-slack-notificat
 | `COINFLOW_VALIDATION_KEY` | `COINFLOW_VALIDATION_KEY` | Webhook signature verification |
 | `DATABASE_URL` | `DATABASE_URL` | Cloud SQL via Unix socket: `postgresql+psycopg2://webhook:<pass>@/compliance?host=/cloudsql/coinflow-slack-notifications:us-central1:fraud-db` |
 | `WEBHOOK_PATH_TOKEN` | `WEBHOOK_PATH_TOKEN` | 48-char hex token embedded in the webhook URL path (replaces IAM auth — org policy blocks `allUsers`) |
+| `BACKOFFICE_API_KEY` | `BACKOFFICE_API_KEY` | Icebox back-office ban endpoint authentication |
+
+`BACKOFFICE_API_URL` is set as a plain (non-secret) Cloud Run env var on the prod revision (`https://icybox.api.infiniteedgers.com/api`); local dev overrides it to the dev host (`icyboxdev.infiniteedgers.com/api`) via `.env`.
 
 ### Cloud Run config
 

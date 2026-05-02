@@ -102,6 +102,9 @@ COINFLOW_API_KEY         = os.getenv("COINFLOW_API_KEY", "")
 COINFLOW_VALIDATION_KEY  = os.getenv("COINFLOW_VALIDATION_KEY", "")
 WEBHOOK_PATH_TOKEN       = os.getenv("WEBHOOK_PATH_TOKEN", "")
 
+BACKOFFICE_API_URL = os.getenv("BACKOFFICE_API_URL", "https://icybox.api.infiniteedgers.com/api")
+BACKOFFICE_API_KEY = os.getenv("BACKOFFICE_API_KEY", "")
+
 SLACK_BOT_TOKEN      = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL_ID     = os.getenv("SLACK_CHANNEL_ID", "")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
@@ -447,14 +450,14 @@ def _build_slack_blocks(
 
     blocks.append({"type": "actions", "elements": [{
         "type":      "button",
-        "text":      {"type": "plain_text", "text": "Block in Coinflow"},
+        "text":      {"type": "plain_text", "text": "Block user"},
         "style":     "danger",
         "action_id": "block_customer",
-        "value":     customer_id,
+        "value":     json.dumps({"cid": customer_id, "pid": payment_id}),
         "confirm": {
             "title":   {"type": "plain_text", "text": "Block customer?"},
             "text":    {"type": "mrkdwn",
-                        "text": f"Block *{card_name or customer_id}* in Coinflow?"},
+                        "text": f"Block *{card_name or customer_id}*?"},
             "confirm": {"type": "plain_text", "text": "Block"},
             "deny":    {"type": "plain_text", "text": "Cancel"},
         },
@@ -706,6 +709,45 @@ def _block_in_coinflow(customer_id: str) -> bool:
         return False
 
 
+def _block_in_backoffice(payment_id: str) -> bool:
+    """POST to the back-office ban-by-payment-id endpoint. Retries up to 3 times on transient errors."""
+    if not payment_id or not BACKOFFICE_API_KEY:
+        return False
+    url     = f"{BACKOFFICE_API_URL}/external/fraud/ban-by-payment-id"
+    body    = {"payment_id": payment_id.replace("-", "")}
+    headers = {"Authorization": BACKOFFICE_API_KEY, "Content-Type": "application/json"}
+    last_err: str | None = None
+    for delay in (0, 0.5, 1.0):
+        if delay:
+            time.sleep(delay)
+        try:
+            resp = requests.post(url, json=body, headers=headers, timeout=15)
+            if resp.ok:
+                return True
+            if resp.status_code < 500:
+                print(f"⚠  Back-office block API error: {resp.status_code} {resp.text[:200]}")
+                return False
+            last_err = f"{resp.status_code} {resp.text[:200]}"
+        except requests.exceptions.RequestException as exc:
+            last_err = str(exc)
+    print(f"⚠  Back-office block API error after 3 attempts: {last_err}")
+    return False
+
+
+def _block_status_text(coinflow_ok: bool, backoffice_ok: bool, *, auto: bool = False, suffix: str = "") -> str:
+    """Single line summarizing the outcome of the two block calls, for Slack context block."""
+    blocked = "Auto-blocked" if auto else "Blocked"
+    if coinflow_ok and backoffice_ok:
+        body = f"❌ {blocked} in Coinflow + back office"
+    elif coinflow_ok and not backoffice_ok:
+        body = f"❌ {blocked} in Coinflow — ⚠️ back-office failed, block manually"
+    elif backoffice_ok and not coinflow_ok:
+        body = f"⚠️ Coinflow block failed — ❌ {blocked} in back office, finish in Coinflow manually"
+    else:
+        body = "⚠️ Auto-block failed in both — block manually" if auto else "⚠️ Block failed in both — block manually"
+    return f"{body}{suffix}"
+
+
 # ── Slack API ─────────────────────────────────────────────────────────────────
 
 def _post_to_slack(color: str, blocks: list) -> str | None:
@@ -928,8 +970,10 @@ def webhook(token: str) -> tuple:
         with _lock:
             added = _append_to_blocked_list(tx_df, reason_summary)
         cid_to_block = str(tx_df.iloc[0].get("customer_id", "")).strip()
-        blocked_ok   = _block_in_coinflow(cid_to_block)
-        fired_str    = ", ".join(sorted(fired_instant))
+        pid_to_block = _norm_id(str(tx_df.iloc[0].get("payment_id", "")))
+        blocked_ok    = _block_in_coinflow(cid_to_block)
+        backoffice_ok = _block_in_backoffice(pid_to_block)
+        fired_str     = ", ".join(sorted(fired_instant))
         if added:
             print(f"[{_ts()}] ⚠  AUTO-BLOCKED: {fired_str} fired — appended to {BLOCKED_LIST_PATH}")
         else:
@@ -939,8 +983,12 @@ def webhook(token: str) -> tuple:
             print(f"⚠  Blocked in Coinflow: {cid_to_block}")
         else:
             print(f"⚠  Coinflow block API call failed for {cid_to_block} — block manually")
+        if backoffice_ok:
+            print(f"⚠  Blocked in back office: {pid_to_block}")
+        else:
+            print(f"⚠  Back-office block API call failed for {pid_to_block} — block manually")
         if slack_ts and slack_color:
-            status_text = "❌ Auto-blocked in Coinflow" if blocked_ok else "⚠️ Auto-block API failed — block manually"
+            status_text = _block_status_text(blocked_ok, backoffice_ok, auto=True)
             updated = [b for b in slack_blocks_orig if b.get("type") != "actions"]
             updated.append({"type": "context",
                              "elements": [{"type": "mrkdwn", "text": status_text}]})
@@ -961,13 +1009,20 @@ def slack_actions() -> tuple:
     user    = payload.get("user", {}).get("name", "unknown")
 
     if action.get("action_id") == "block_customer":
-        customer_id = action.get("value", "")
-        blocked_ok  = _block_in_coinflow(customer_id)
-        status_text = (
-            f"❌ Blocked in Coinflow by @{user}"
-            if blocked_ok else
-            f"⚠️ Block API failed — block manually (@{user} attempted)"
-        )
+        raw_value = action.get("value", "") or ""
+        try:
+            data = json.loads(raw_value) if raw_value else {}
+            customer_id = str(data.get("cid", "") or "")
+            payment_id  = str(data.get("pid", "") or "")
+        except json.JSONDecodeError:
+            # Legacy buttons (posted before the back-office change) carried the customer_id as a plain string.
+            customer_id = raw_value
+            payment_id  = ""
+        blocked_ok    = _block_in_coinflow(customer_id)
+        backoffice_ok = _block_in_backoffice(payment_id)
+        status_text   = _block_status_text(blocked_ok, backoffice_ok, suffix=f" by @{user}")
+        if not payment_id:
+            status_text += " — back-office not called (legacy alert; re-trigger from a fresh alert to ban there)"
         attachments     = payload.get("message", {}).get("attachments") or [{}]
         orig_color      = attachments[0].get("color", _SLACK_COLORS["clean"])
         original_blocks = attachments[0].get("blocks", [])
