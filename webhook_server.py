@@ -996,32 +996,46 @@ def webhook(token: str) -> tuple:
 
     if fired_instant:
         reason_summary = _get_val(result_row, "reason_summary")
-        with _lock:
-            added = _append_to_blocked_list(tx_df, reason_summary)
-        cid_to_block  = str(tx_df.iloc[0].get("customer_id", "")).strip()
-        pid_to_block  = str(tx_df.iloc[0].get("payment_id", ""))
-        blocked_ok    = _block_in_coinflow(cid_to_block)
-        backoffice_ok = _block_in_backoffice(pid_to_block)
-        fired_str     = ", ".join(sorted(fired_instant))
-        if added:
-            print(f"[{_ts()}] ⚠  AUTO-BLOCKED: {fired_str} fired — appended to {BLOCKED_LIST_PATH}")
+        fired_str      = ", ".join(sorted(fired_instant))
+        if is_verified:
+            print(f"[{_ts()}] ⊕ AUTO-BAN SUPPRESSED ({fired_str}) — customer on verified list")
+            print(f"   Reason: {reason_summary}")
+            if slack_ts and slack_color:
+                suppressed_text = (
+                    f"⊕ Auto-ban suppressed — customer on verified list "
+                    f"(rules that would have fired: {fired_str}). Manual ban buttons still available above."
+                )
+                updated = list(slack_blocks_orig) + [{
+                    "type": "context",
+                    "elements": [{"type": "mrkdwn", "text": suppressed_text}],
+                }]
+                _update_slack_message(slack_ts, slack_color, updated)
         else:
-            print(f"[{_ts()}] ⚠  AUTO-BLOCKED rules fired ({fired_str}) — customer already in blocked list")
-        print(f"   Reason: {reason_summary}")
-        if blocked_ok:
-            print(f"⚠  Blocked in Coinflow: {cid_to_block}")
-        else:
-            print(f"⚠  Coinflow block API call failed for {cid_to_block} — block manually")
-        if backoffice_ok:
-            print(f"⚠  Blocked in back office: {pid_to_block}")
-        else:
-            print(f"⚠  Back-office block API call failed for {pid_to_block} — block manually")
-        if slack_ts and slack_color:
-            status_text = _block_status_text(blocked_ok, backoffice_ok, auto=True)
-            updated = [b for b in slack_blocks_orig if b.get("type") != "actions"]
-            updated.append({"type": "context",
-                             "elements": [{"type": "mrkdwn", "text": status_text}]})
-            _update_slack_message(slack_ts, slack_color, updated)
+            with _lock:
+                added = _append_to_blocked_list(tx_df, reason_summary)
+            cid_to_block  = str(tx_df.iloc[0].get("customer_id", "")).strip()
+            pid_to_block  = str(tx_df.iloc[0].get("payment_id", ""))
+            blocked_ok    = _block_in_coinflow(cid_to_block)
+            backoffice_ok = _block_in_backoffice(pid_to_block)
+            if added:
+                print(f"[{_ts()}] ⚠  AUTO-BLOCKED: {fired_str} fired — appended to {BLOCKED_LIST_PATH}")
+            else:
+                print(f"[{_ts()}] ⚠  AUTO-BLOCKED rules fired ({fired_str}) — customer already in blocked list")
+            print(f"   Reason: {reason_summary}")
+            if blocked_ok:
+                print(f"⚠  Blocked in Coinflow: {cid_to_block}")
+            else:
+                print(f"⚠  Coinflow block API call failed for {cid_to_block} — block manually")
+            if backoffice_ok:
+                print(f"⚠  Blocked in back office: {pid_to_block}")
+            else:
+                print(f"⚠  Back-office block API call failed for {pid_to_block} — block manually")
+            if slack_ts and slack_color:
+                status_text = _block_status_text(blocked_ok, backoffice_ok, auto=True)
+                updated = [b for b in slack_blocks_orig if b.get("type") != "actions"]
+                updated.append({"type": "context",
+                                 "elements": [{"type": "mrkdwn", "text": status_text}]})
+                _update_slack_message(slack_ts, slack_color, updated)
 
     return jsonify({"status": "ok"}), 200
 

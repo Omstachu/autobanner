@@ -40,6 +40,10 @@ FUZZY_MATCH_THRESHOLD = 90
 # Auto-block (webhook_server.py) requires exact match (score == 100), not just HIGH level
 EMAIL_BLOCKED_HIGH_THRESHOLD = 95
 
+# MULTIPLE_CARD_NAMES tuning
+FUZZY_NAME_CLUSTER_THRESHOLD = 98   # full-name fuzzy ratio ≥ this → same identity cluster
+MULTIPLE_NAMES_MIN_CLUSTERS  = 3    # number of distinct identity clusters before rule fires
+
 # City mismatch: fuzzy passthrough to avoid false positives on abbreviations
 FUZZY_CITY_PASS_THRESHOLD = 80
 
@@ -352,7 +356,7 @@ def _norm_str(s: str) -> str:
 
 
 def _normalize_name(s) -> str:
-    """Lowercase, strip whitespace, drop diacritics. 'José' → 'jose'."""
+    """Lowercase, strip whitespace, drop diacritics and punctuation. 'T.J.' → 'tj', 'José' → 'jose'."""
     if s is None or (isinstance(s, float) and pd.isna(s)):
         return ""
     s = str(s).strip().lower()
@@ -360,7 +364,8 @@ def _normalize_name(s) -> str:
         return ""
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return s
+    s = re.sub(r"[^\w\s]", "", s)
+    return s.strip()
 
 
 def _name_tokens(name: str) -> frozenset:
@@ -370,9 +375,11 @@ def _name_tokens(name: str) -> frozenset:
 
 def _cluster_names(names) -> list:
     """
-    Cluster a list of normalized names by token-subset relation.
-    Two names are the same identity if one's token set is a subset of the other's,
-    provided the smaller set has ≥2 tokens (single-token names like 'noel' don't subset-match).
+    Cluster a list of normalized names. Two names join the same cluster if either:
+      - one's token set is a subset of the other's, with ≥2 tokens on the smaller side
+        (so 'noel ramirez' ⊆ 'noel prada ramirez' clusters; 'noel' alone does not), OR
+      - their fuzzy ratio is ≥ FUZZY_NAME_CLUSTER_THRESHOLD (catches near-identical
+        variants like spacing/typos that survive normalization).
 
     Returns a list of clusters; each cluster is a list of names sorted longest-first
     so the first element is the canonical representative. Output order is deterministic.
@@ -402,13 +409,13 @@ def _cluster_names(names) -> list:
     toks = [_name_tokens(n) for n in unique]
     for i in range(n):
         ti = toks[i]
-        if len(ti) < 2:
-            continue
         for j in range(i + 1, n):
             tj = toks[j]
-            if len(tj) < 2:
-                continue
-            if ti <= tj or tj <= ti:
+            subset_match = (
+                len(ti) >= 2 and len(tj) >= 2 and (ti <= tj or tj <= ti)
+            )
+            fuzzy_match = fuzz.ratio(unique[i], unique[j]) >= FUZZY_NAME_CLUSTER_THRESHOLD
+            if subset_match or fuzzy_match:
                 union(i, j)
 
     groups: dict = {}
@@ -1071,12 +1078,12 @@ def _precompute_vectorized(df: pd.DataFrame, blocked_df: pd.DataFrame,
         cust_to_clusters = per_cust.to_dict()
 
         df["_r16_flag"] = df["customer_id"].map(
-            lambda cid: len(cust_to_clusters.get(cid, [])) > 1
+            lambda cid: len(cust_to_clusters.get(cid, [])) >= MULTIPLE_NAMES_MIN_CLUSTERS
         ).fillna(False).astype(bool)
 
         def _other_reps(cid: str, this_name: str) -> str:
             clusters = cust_to_clusters.get(cid, [])
-            if len(clusters) <= 1:
+            if len(clusters) < MULTIPLE_NAMES_MIN_CLUSTERS:
                 return ""
             this_rep = next((c[0] for c in clusters if this_name in c), this_name)
             return "|||".join(c[0] for c in clusters if c[0] != this_rep)

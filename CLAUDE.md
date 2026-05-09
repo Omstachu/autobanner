@@ -119,9 +119,19 @@ Three tables, created automatically by `db.init_db()` on server startup:
 
 ### Querying the DB from Claude Code
 
-A read-only Postgres MCP server is wired up via `.mcp.json` at the repo root. When Claude Code starts a session in this directory it spawns [`crystaldba/postgres-mcp`](https://github.com/crystaldba/postgres-mcp) (via `uvx`, pinned to Python 3.12 because `pglast` has no wheels for 3.13+) in `--access-mode=restricted` (only `SELECT` is allowed), pointed at `${DATABASE_URL}` with the SQLAlchemy `postgresql+psycopg2:` scheme rewritten to plain `postgresql:` at launch. Use the MCP for pure SQL questions — Claude can write the query itself. Use `analyze.py` when the answer needs pandas/numpy on top of the rows. See `potential_upgrades.md` for follow-ups.
+A read-only Postgres MCP server is wired up via `.mcp.json` at the repo root. When Claude Code starts a session in this directory it sources `.env` (via `set -a; . .env; set +a`) then spawns [`crystaldba/postgres-mcp`](https://github.com/crystaldba/postgres-mcp) (via `uvx`, pinned to Python 3.12 because `pglast` has no wheels for 3.13+) in `--access-mode=restricted` (only `SELECT` is allowed), pointed at `${DATABASE_URL}` with the SQLAlchemy `postgresql+psycopg2:` scheme rewritten to plain `postgresql:` at launch. Use the MCP for pure SQL questions — Claude can write the query itself. Use `analyze.py` when the answer needs pandas/numpy on top of the rows. See `potential_upgrades.md` for follow-ups. **If the MCP stops working, read `mcp_debug_history.md` before changing `.mcp.json`.**
 
-Requires `uv` on the local machine (`brew install uv`).
+Local dev uses a dedicated **`compliance_readonly`** Postgres role (SELECT-only on the `compliance` schema). The password is stored in Secret Manager as `DATABASE_URL_READONLY` (project `coinflow-slack-notifications`). Belt-and-suspenders on top of the MCP's transaction-level read-only enforcement: even if you accidentally run a write script (`download_payments.py`, `build_blocked_list.py`, `seed_*`, `add_verified_customer.py`), it errors with `permission denied` instead of mutating prod. Doesn't isolate `fetch_and_score.py` or `webhook_server.py` — those write via the Coinflow REST API, not the DB. To run a write script locally on purpose, temporarily swap `DATABASE_URL` in `.env` to the `webhook` user (password in Secret Manager as `DATABASE_URL`).
+
+Prerequisites for the MCP to work each session:
+
+1. `cloud-sql-proxy` running locally (the prod DB is Cloud SQL, accessed via Unix socket only from inside Cloud Run):
+   ```
+   cloud-sql-proxy coinflow-slack-notifications:us-central1:fraud-db --port 15432
+   ```
+   Leave it running in a separate terminal. (Port 15432 chosen to avoid colliding with a Docker postgres on 5432.)
+2. `gcloud auth application-default login --project=coinflow-slack-notifications` — needed for cloud-sql-proxy. Re-run if you see `invalid_rapt`.
+3. `uv` (`brew install uv`) and `cloud-sql-proxy` (`brew install cloud-sql-proxy`) on the local machine.
 
 ## blocked_users.csv / blocked_users table
 
@@ -164,6 +174,8 @@ Customers that have been manually reviewed. Being on this list is a prior-review
 
 Add a customer: `python3 add_verified_customer.py <paymentId>`. The webhook server loads this CSV on hourly refresh and shows a `⊕ Previously Verified` badge (in mauve) when a transaction comes in from a verified customer.
 
+**Auto-ban suppression**: when a verified customer's transaction triggers any `INSTANT_BLOCK_RULES`, the webhook server skips the auto-ban path entirely — no Coinflow block, no back-office call, no append to `blocked_users`. The Slack alert still posts (with the verified badge and a context note explaining which rules would have fired) and the manual-ban buttons remain clickable, so a reviewer can still override. Verified is a "trusted, but not immune" signal.
+
 ## webhook_server.py behavior
 
 Real-time scoring server. On each incoming webhook:
@@ -190,7 +202,7 @@ Real-time scoring server. On each incoming webhook:
 | `EMAIL_BLOCKED` | Email exactly matches a blocked user (score == 100; fuzzy matches flag only) |
 | `AUTH_CODES_INSTANT` | Auth code in `AUTH_CODE_INSTANT_BAN` set |
 | `FRAUD_CODE_ZERO_ACCEPT` | Auth code 59/83 + 0% acceptance rate + ≥3 transactions |
-| `MULTI_NAME_LOW_ACCEPT` | Multiple card names + <50% acceptance + ≥3 transactions |
+| `MULTI_NAME_LOW_ACCEPT` | ≥3 distinct identity clusters + <50% acceptance + ≥3 transactions |
 | `IP_FRAUD_CODE_ZERO_ACCEPT` | IP matches blocked user + auth 59/83 + 0% acceptance |
 
 When any of these fires, the server calls `_block_in_coinflow(customer_id)` (Coinflow `PUT /merchant/blocked/{id}`) **and** `_block_in_backoffice(payment_id)` (Icebox `POST /external/fraud/ban-by-payment-id`). The back-office call retries up to 3 times on transient errors (timeouts, connection errors, 5xx) with 0.5s/1s backoff; 4xx errors fail fast without retry. If either API fails, a warning is printed but the server continues normally. The Slack message attached to the alert is updated with a context block summarizing both outcomes.
@@ -272,11 +284,11 @@ All columns are loaded as strings initially, then coerced to the correct types i
 | STREET_BLOCKED | `card_street` | Fuzzy match vs blocked users' streets ≥90%; skipped if both card ZIP and matched ZIP are known and differ | HIGH |
 | FAILED_PATTERNS | `transaction_status`, `auth_codes`, `total_cents` | Per-customer history: 3+ consecutive failures, escalating amounts, large failed transactions, early-account failure clusters, mid-history failures | HIGH / MEDIUM / LOW |
 | FRAUD_CODE_ZERO_ACCEPT | `auth_codes`, `transaction_status` | Auth code 59/83 present with 0% acceptance rate across ≥3 transactions | HIGH (weight 100) |
-| MULTI_NAME_LOW_ACCEPT | `card_first_name`, `card_last_name`, `transaction_status` | Multiple card names used + <50% acceptance rate across ≥3 transactions | HIGH (weight 150) |
+| MULTI_NAME_LOW_ACCEPT | `card_first_name`, `card_last_name`, `transaction_status` | ≥3 distinct identity clusters across the customer's history + <50% acceptance rate across ≥3 transactions | HIGH (weight 150) |
 | IP_FRAUD_CODE_ZERO_ACCEPT | `card_ip`, `auth_codes`, `transaction_status` | IP matches blocked user AND customer has 0% acceptance with auth 59/83 | HIGH (weight 100) |
 | GEO_RISK / GEO_RISK_IP | `card_city`, `card_ip_city` | City in risky list (fuzzy match at 85%); IP city weighted slightly higher (15 vs 10) | LOW |
 | AMOUNT_FLAG | `total_cents` | 99¢ ending → LOW; non-standard amount on first transaction → LOW; >$100 → FLAG_LOW; >$200 → LOW; >$500 → MEDIUM; >$1000 → MEDIUM ("extremely large"); large FAILED >$500 → LOW | FLAG_LOW → MEDIUM |
-| MULTIPLE_CARD_NAMES | `card_first_name`, `card_last_name` | Customer uses more than one distinct full name across transactions; names that are token-subsets of each other are clustered as one identity (so middle-name additions and Hispanic two-surname patterns don't fire) | HIGH (weight 150) |
+| MULTIPLE_CARD_NAMES | `card_first_name`, `card_last_name` | Customer's card names form ≥3 distinct identity clusters. Names are clustered if either (a) one's tokens are a subset of the other's (middle-name and two-surname patterns) or (b) their fuzzy ratio is ≥98% (punctuation/typo variants like `T.J.`/`TJ`). Punctuation is stripped during normalization. | HIGH (weight 150) |
 | GENDER_SWITCH | `card_first_name`, `card_last_name` | Card names switch between female and male across transactions (sub-flag of MULTIPLE_CARD_NAMES) | MEDIUM |
 | EMAIL_NAME_MISMATCH | `card_email`, `card_first_name`, `card_last_name` | Email local part looks name-formatted but doesn't fuzzy-match the card name at ≥75% | LOW |
 
@@ -289,6 +301,8 @@ All thresholds are named constants — nothing is hardcoded in rule logic.
 | `MIN_RISK_THRESHOLD` | 5 | Min score to appear in output |
 | `FUZZY_MATCH_THRESHOLD` | 90 | Single fuzzy similarity % used by all fuzzy rules (email, name, street) |
 | `EMAIL_BLOCKED_HIGH_THRESHOLD` | 95 | Email fuzzy match ≥ this → HIGH; 90–94% → MEDIUM; auto-block requires score == 100 |
+| `FUZZY_NAME_CLUSTER_THRESHOLD` | 98 | Card-name clustering: full-name fuzzy ratio ≥ this collapses to one identity (catches `T.J.`/`TJ`, typos) |
+| `MULTIPLE_NAMES_MIN_CLUSTERS` | 3 | Distinct identity clusters required before `MULTIPLE_CARD_NAMES` / `MULTI_NAME_LOW_ACCEPT` / `GENDER_SWITCH` fire |
 | `FUZZY_CITY_PASS_THRESHOLD` | 80 | City fuzzy passthrough — avoids false positives on abbreviations |
 | `RISKY_CITY_FUZZY_THRESHOLD` | 85 | Fuzzy match threshold for risky city detection (catches misspellings) |
 | `VALID_AMOUNTS` | [5000, 10000, 50000, 100000] | Standard price points in cents ($50/$100/$500/$1000) |
@@ -328,7 +342,7 @@ Use `AUTH_CODE_RISK_OVERRIDE` and `AUTH_CODE_SCORE_OVERRIDE` dicts to tune indiv
 
 - Fuzzy matching rules (EMAIL_BLOCKED, NAME_BLOCKED, STREET_BLOCKED) use `rapidfuzz.process.extractOne` called once per row — adequate for tens of thousands of rows.
 - Rule 13 (FAILED_PATTERNS) uses `groupby("customer_id").apply()` to analyze per-customer transaction history. pandas drops the groupby key from the result; it is restored explicitly after the apply.
-- MULTIPLE_CARD_NAMES clusters each customer's names by token-subset relation (`_cluster_names()`) — `noel ramirez` ⊆ `noel prada ramirez` is one identity. Single-token names (e.g. just `noel`) don't subset-match. Diacritics are stripped (`josé` ≡ `jose`); hyphenated surnames stay one token. Gender switch detection still uses `groupby.transform("any")` and is gated on the cluster-based `_r16_flag`.
+- MULTIPLE_CARD_NAMES clusters each customer's names via `_cluster_names()`. Two names collapse to one cluster if either (a) one's token set is a subset of the other's with ≥2 tokens on the smaller side (`noel ramirez` ⊆ `noel prada ramirez`) or (b) their `fuzz.ratio` is ≥ `FUZZY_NAME_CLUSTER_THRESHOLD` (98% — catches `T.J.`/`TJ` and typos). Normalization strips diacritics and punctuation (`josé` ≡ `jose`, `T.J.` ≡ `tj`); hyphenated surnames lose their hyphen but stay one token. The rule fires only when `≥ MULTIPLE_NAMES_MIN_CLUSTERS` (3) clusters exist. Gender switch detection uses `groupby.transform("any")` and is gated on the same `_r16_flag`.
 - All other rules use vectorized pandas operations.
 
 ## Female name detection
