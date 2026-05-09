@@ -2,8 +2,10 @@
 Add a customer to the verified_customers table by payment ID.
 
 Fetches the payment from the Coinflow API to get the customer ID and card details,
-then inserts a row into the database. Being on this list means the customer has been
-previously reviewed — it does not mean they cannot commit fraud.
+then inserts a row into the database. Verified customers are exempt from auto-ban
+(Coinflow + back-office) in webhook_server.py, but rules still fire for visibility
+and manual ban via the Slack button remains available — verified is "trusted, but
+not immune."
 
 Usage:
     python add_verified_customer.py <paymentId>
@@ -102,7 +104,8 @@ def main() -> None:
     print(f"Added: {name}  |  {customer_id}")
     if email:
         print(f"Email: {email}")
-    print("Note: this flags the customer as previously reviewed, not permanently safe.")
+    print("Note: this customer is now exempt from auto-ban (Coinflow + back-office)")
+    print("      but rules still fire for visibility and manual ban via Slack stays available.")
 
 
 if __name__ == "__main__":
