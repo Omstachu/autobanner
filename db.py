@@ -384,6 +384,34 @@ def add_verified_customer(entry: dict) -> bool:
     return result.rowcount > 0
 
 
+def lookup_customer_for_allowlist(customer_id: str) -> dict | None:
+    """
+    Find a customer's most recent payment so we can populate the verified_customers row.
+    Matches on dashes-stripped, lowercased customer_id so the input format doesn't matter.
+    Returns {customer_id, card_first_name, card_last_name, card_email, payment_id} or None.
+    """
+    cid = str(customer_id or "").replace("-", "").strip().lower()
+    if not cid:
+        return None
+    sql = text(
+        "SELECT customer_id, card_first_name, card_last_name, card_email, payment_id "
+        "FROM payments "
+        "WHERE REPLACE(LOWER(customer_id), '-', '') = :cid "
+        "ORDER BY transaction_created_at DESC NULLS LAST LIMIT 1"
+    )
+    with get_engine().connect() as conn:
+        row = conn.execute(sql, {"cid": cid}).fetchone()
+    if not row:
+        return None
+    return {
+        "customer_id":     row[0],
+        "card_first_name": row[1] or "",
+        "card_last_name":  row[2] or "",
+        "card_email":      row[3] or "",
+        "payment_id":      row[4] or "",
+    }
+
+
 def load_verified_customer_ids() -> set:
     """Return a set of lowercased customer_ids from verified_customers."""
     try:

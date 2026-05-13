@@ -403,7 +403,7 @@ def _build_slack_blocks(
             auth_codes = _get_val(tx_row, "auth_codes")
             auth_str   = f" ({auth_codes})" if auth_codes and event_type == "Card Payment Declined" else ""
             fields.append({"type": "mrkdwn", "text": f"*Amount:* {amount} [{status}{auth_str}]"})
-        cid_text = f"<{cust_url}|{customer_id[:8]}...>" if cust_url else customer_id
+        cid_text = f"<{cust_url}|{customer_id}>" if cust_url else customer_id
         if customer_id:
             fields.append({"type": "mrkdwn", "text": f"*Customer:* {cid_text}"})
         sr = _sr_text()
@@ -1067,6 +1067,104 @@ def slack_actions() -> tuple:
         _update_slack_message(msg_ts, orig_color, updated_blocks)
 
     return "", 200
+
+
+@app.route("/slack/commands/allowlist", methods=["POST"])
+def slack_allowlist() -> tuple:
+    """
+    Slash command: /allowlist <customer_id> [note]
+    Inserts the customer into verified_customers, which suppresses auto-ban only —
+    the manual ban button on fraud alerts still works.
+    """
+    raw_body = request.get_data()
+    if not _verify_slack_signature(raw_body, request.headers):
+        return jsonify({"error": "invalid signature"}), 401
+
+    text_arg = (request.form.get("text") or "").strip()
+    user     = (request.form.get("user_name") or "unknown").strip()
+
+    if not text_arg:
+        return jsonify({
+            "response_type": "ephemeral",
+            "text": "Usage: `/allowlist <customer_id> [note]` — copy the full customer_id from a fraud alert.",
+        }), 200
+
+    parts        = text_arg.split(None, 1)
+    raw_input_id = parts[0]
+    note         = parts[1].strip() if len(parts) > 1 else ""
+
+    try:
+        found = db.lookup_customer_for_allowlist(raw_input_id)
+    except Exception as exc:
+        print(f"[allowlist] DB lookup failed: {exc}")
+        return jsonify({
+            "response_type": "ephemeral",
+            "text": f"Allowlist failed: DB lookup error ({exc}). Try again or use the CLI.",
+        }), 200
+
+    if not found:
+        return jsonify({
+            "response_type": "ephemeral",
+            "text": f"No customer found with id `{raw_input_id}`. Copy the full customer_id from the fraud alert.",
+        }), 200
+
+    cid_full    = found["customer_id"]
+    cid_norm    = _norm_id(cid_full)
+    name_parts  = [found.get("card_first_name", ""), found.get("card_last_name", "")]
+    display_name = " ".join(p for p in name_parts if p).strip() or "(no name on file)"
+
+    with _lock:
+        already = cid_norm in _verified_customer_ids
+
+    if already:
+        return jsonify({
+            "response_type": "ephemeral",
+            "text": f"Already allowlisted: *{display_name}* (`{cid_full}`).",
+        }), 200
+
+    entry = {
+        "customer_id":         cid_full,
+        "card_first_name":     found.get("card_first_name", ""),
+        "card_last_name":      found.get("card_last_name", ""),
+        "card_email":          found.get("card_email", ""),
+        "note":                note,
+        "added_at":            datetime.now(UTC).isoformat(),
+        "added_by_payment_id": found.get("payment_id", ""),
+    }
+    try:
+        inserted = db.add_verified_customer(entry)
+    except Exception as exc:
+        print(f"[allowlist] DB insert failed: {exc}")
+        return jsonify({
+            "response_type": "ephemeral",
+            "text": f"Allowlist failed: DB insert error ({exc}). Try again or use the CLI.",
+        }), 200
+
+    with _lock:
+        _verified_customer_ids.add(cid_norm)
+
+    print(f"[{_ts()}] ⊕ ALLOWLISTED {display_name} ({cid_full}) by @{user}"
+          + (f" — note: {note}" if note else ""))
+
+    audit_text = (
+        f"⊕ *{display_name}* (`{cid_full}`) allowlisted by @{user} "
+        f"— auto-ban now suppressed (manual ban still works)."
+    )
+    if note:
+        audit_text += f"\n_Note: {note}_"
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+        _post_to_slack(
+            _slack_color("clean"),
+            [{"type": "context", "elements": [{"type": "mrkdwn", "text": audit_text}]}],
+        )
+
+    reply = f"✅ Allowlisted *{display_name}* (`{cid_full}`)."
+    if not inserted:
+        # Should be rare given the in-memory check above, but cover the race.
+        reply = f"⊕ Already allowlisted: *{display_name}* (`{cid_full}`)."
+    reply += " Auto-ban suppressed; *manual ban via the fraud-alert button is still available.*"
+
+    return jsonify({"response_type": "ephemeral", "text": reply}), 200
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

@@ -172,9 +172,16 @@ Customers that have been manually reviewed. Being on this list is a prior-review
 | `added_at` | ISO timestamp at run time |
 | `added_by_payment_id` | payment ID passed on the CLI |
 
-Add a customer: `python3 add_verified_customer.py <paymentId>`. The webhook server loads this CSV on hourly refresh and shows a `⊕ Previously Verified` badge (in mauve) when a transaction comes in from a verified customer.
+Add a customer (two ways):
 
-**Auto-ban suppression**: when a verified customer's transaction triggers any `INSTANT_BLOCK_RULES`, the webhook server skips the auto-ban path entirely — no Coinflow block, no back-office call, no append to `blocked_users`. The Slack alert still posts (with the verified badge and a context note explaining which rules would have fired) and the manual-ban buttons remain clickable, so a reviewer can still override. Verified is a "trusted, but not immune" signal.
+- **From Slack**: `/allowlist <customer_id> [note]` — copy the full `customer_id` from any fraud alert. Endpoint: `POST /slack/commands/allowlist` (verified via Slack signing secret). Inserts into `verified_customers` and updates the webhook server's in-memory set immediately. Posts an ephemeral confirmation to the operator and a short audit line to `SLACK_CHANNEL_ID`. The Slack app must have the `commands` scope and a slash command pointing to `https://auto-compliance-jmdtnfwaya-uc.a.run.app/slack/commands/allowlist`.
+- **From CLI**: `python3 add_verified_customer.py <paymentId>` (unchanged).
+
+The webhook server also refreshes the verified set from the DB hourly, and shows a `⊕ Previously Verified` badge (in mauve) when a transaction comes in from a verified customer.
+
+**Auto-ban suppression**: when a verified customer's transaction triggers any `INSTANT_BLOCK_RULES`, the webhook server skips the **auto-ban path only** — no Coinflow block, no back-office call, no append to `blocked_users`. The Slack alert still posts (with the verified badge and a context note explaining which rules would have fired), rules still flag, and the **manual ban button on the fraud alert still works**. Allowlisting is "trusted, but not immune" — it gates the automated ban actions, not the operator override.
+
+The full `customer_id` is shown in Slack alerts (not truncated) so it can be copy/pasted into `/allowlist` directly.
 
 ## webhook_server.py behavior
 
