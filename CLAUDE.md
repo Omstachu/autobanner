@@ -174,14 +174,14 @@ Customers that have been manually reviewed. Being on this list is a prior-review
 
 Add a customer (two ways):
 
-- **From Slack**: `/allowlist <customer_id> [note]` — copy the full `customer_id` from any fraud alert. Endpoint: `POST /slack/commands/allowlist` (verified via Slack signing secret). Inserts into `verified_customers` and updates the webhook server's in-memory set immediately. Posts an ephemeral confirmation to the operator and a short audit line to `SLACK_CHANNEL_ID`. The Slack app must have the `commands` scope and a slash command pointing to `https://auto-compliance-jmdtnfwaya-uc.a.run.app/slack/commands/allowlist`.
-- **From CLI**: `python3 add_verified_customer.py <paymentId>` (unchanged).
+- **From Slack**: click the green **Allowlist** button on any fraud alert and confirm in the dialog. Handler: `POST /slack/actions` with `action_id="allowlist_customer"` (same endpoint that handles the Block button; verified via Slack signing secret). Inserts into `verified_customers`, updates the webhook server's in-memory `_verified_customer_ids` set immediately, and replaces the alert's button row with a context block (`⊕ Allowlisted *<name>* by @<user>`). Channel membership gates access — only people who can see the fraud-alert channel can click. No slash command — too broadly accessible.
+- **From CLI**: `python3 add_verified_customer.py <paymentId>` (unchanged; supports `--note`).
 
 The webhook server also refreshes the verified set from the DB hourly, and shows a `⊕ Previously Verified` badge (in mauve) when a transaction comes in from a verified customer.
 
 **Auto-ban suppression**: when a verified customer's transaction triggers any `INSTANT_BLOCK_RULES`, the webhook server skips the **auto-ban path only** — no Coinflow block, no back-office call, no append to `blocked_users`. The Slack alert still posts (with the verified badge and a context note explaining which rules would have fired), rules still flag, and the **manual ban button on the fraud alert still works**. Allowlisting is "trusted, but not immune" — it gates the automated ban actions, not the operator override.
 
-The full `customer_id` is shown in Slack alerts (not truncated) so it can be copy/pasted into `/allowlist` directly.
+The full `customer_id` is shown in Slack alerts (not truncated) for debugging / cross-referencing the Coinflow dashboard.
 
 ## webhook_server.py behavior
 

@@ -448,20 +448,37 @@ def _build_slack_blocks(
     if fields:
         blocks.append({"type": "section", "fields": fields})
 
-    blocks.append({"type": "actions", "elements": [{
-        "type":      "button",
-        "text":      {"type": "plain_text", "text": "Block user"},
-        "style":     "danger",
-        "action_id": "block_customer",
-        "value":     _pack_btn_value(customer_id, payment_id),
-        "confirm": {
-            "title":   {"type": "plain_text", "text": "Block customer?"},
-            "text":    {"type": "mrkdwn",
-                        "text": f"Block *{card_name or customer_id}*?"},
-            "confirm": {"type": "plain_text", "text": "Block"},
-            "deny":    {"type": "plain_text", "text": "Cancel"},
+    blocks.append({"type": "actions", "elements": [
+        {
+            "type":      "button",
+            "text":      {"type": "plain_text", "text": "Block user"},
+            "style":     "danger",
+            "action_id": "block_customer",
+            "value":     _pack_btn_value(customer_id, payment_id),
+            "confirm": {
+                "title":   {"type": "plain_text", "text": "Block customer?"},
+                "text":    {"type": "mrkdwn",
+                            "text": f"Block *{card_name or customer_id}*?"},
+                "confirm": {"type": "plain_text", "text": "Block"},
+                "deny":    {"type": "plain_text", "text": "Cancel"},
+            },
         },
-    }]})
+        {
+            "type":      "button",
+            "text":      {"type": "plain_text", "text": "Allowlist"},
+            "style":     "primary",
+            "action_id": "allowlist_customer",
+            "value":     _pack_btn_value(customer_id, payment_id),
+            "confirm": {
+                "title":   {"type": "plain_text", "text": "Allowlist customer?"},
+                "text":    {"type": "mrkdwn",
+                            "text": f"Suppress auto-ban for *{card_name or customer_id}*? "
+                                    "Rules will still flag future transactions and the manual ban button stays available."},
+                "confirm": {"type": "plain_text", "text": "Allowlist"},
+                "deny":    {"type": "plain_text", "text": "Cancel"},
+            },
+        },
+    ]})
 
     blocks.append({"type": "divider"})
     blocks.append({"type": "section", "text": {"type": "mrkdwn",
@@ -1066,105 +1083,68 @@ def slack_actions() -> tuple:
         })
         _update_slack_message(msg_ts, orig_color, updated_blocks)
 
-    return "", 200
+    elif action.get("action_id") == "allowlist_customer":
+        customer_id, payment_id = _unpack_btn_value(action.get("value", ""))
+        attachments     = payload.get("message", {}).get("attachments") or [{}]
+        orig_color      = attachments[0].get("color", _SLACK_COLORS["clean"])
+        original_blocks = attachments[0].get("blocks", [])
 
+        def _replace_actions(text: str) -> None:
+            new_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+            new_blocks.append({"type": "context",
+                               "elements": [{"type": "mrkdwn", "text": text}]})
+            _update_slack_message(msg_ts, orig_color, new_blocks)
 
-@app.route("/slack/commands/allowlist", methods=["POST"])
-def slack_allowlist() -> tuple:
-    """
-    Slash command: /allowlist <customer_id> [note]
-    Inserts the customer into verified_customers, which suppresses auto-ban only —
-    the manual ban button on fraud alerts still works.
-    """
-    raw_body = request.get_data()
-    if not _verify_slack_signature(raw_body, request.headers):
-        return jsonify({"error": "invalid signature"}), 401
+        try:
+            found = db.lookup_customer_for_allowlist(customer_id)
+        except Exception as exc:
+            print(f"[{_ts()}] [allowlist] DB lookup failed for {customer_id}: {exc}")
+            _replace_actions(f"⚠️ Allowlist failed — DB lookup error. Try `add_verified_customer.py` from the CLI.")
+            return "", 200
 
-    text_arg = (request.form.get("text") or "").strip()
-    user     = (request.form.get("user_name") or "unknown").strip()
+        if not found:
+            print(f"[{_ts()}] [allowlist] no payment row for customer {customer_id}")
+            _replace_actions(f"⚠️ Allowlist failed — no payment history found for `{customer_id}`.")
+            return "", 200
 
-    if not text_arg:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": "Usage: `/allowlist <customer_id> [note]` — copy the full customer_id from a fraud alert.",
-        }), 200
+        cid_full     = found["customer_id"]
+        cid_norm     = _norm_id(cid_full)
+        name_parts   = [found.get("card_first_name", ""), found.get("card_last_name", "")]
+        display_name = " ".join(p for p in name_parts if p).strip() or "(no name on file)"
 
-    parts        = text_arg.split(None, 1)
-    raw_input_id = parts[0]
-    note         = parts[1].strip() if len(parts) > 1 else ""
+        with _lock:
+            already = cid_norm in _verified_customer_ids
 
-    try:
-        found = db.lookup_customer_for_allowlist(raw_input_id)
-    except Exception as exc:
-        print(f"[allowlist] DB lookup failed: {exc}")
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": f"Allowlist failed: DB lookup error ({exc}). Try again or use the CLI.",
-        }), 200
+        if already:
+            print(f"[{_ts()}] ⊕ allowlist-button: {display_name} ({cid_full}) already allowlisted (clicked by @{user})")
+            _replace_actions(f"⊕ Already allowlisted: *{display_name}*.")
+            return "", 200
 
-    if not found:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": f"No customer found with id `{raw_input_id}`. Copy the full customer_id from the fraud alert.",
-        }), 200
+        entry = {
+            "customer_id":         cid_full,
+            "card_first_name":     found.get("card_first_name", ""),
+            "card_last_name":      found.get("card_last_name", ""),
+            "card_email":          found.get("card_email", ""),
+            "note":                "",
+            "added_at":            datetime.now(UTC).isoformat(),
+            "added_by_payment_id": found.get("payment_id", "") or payment_id,
+        }
+        try:
+            db.add_verified_customer(entry)
+        except Exception as exc:
+            print(f"[{_ts()}] [allowlist] DB insert failed for {cid_full}: {exc}")
+            _replace_actions(f"⚠️ Allowlist failed — DB insert error. Try `add_verified_customer.py` from the CLI.")
+            return "", 200
 
-    cid_full    = found["customer_id"]
-    cid_norm    = _norm_id(cid_full)
-    name_parts  = [found.get("card_first_name", ""), found.get("card_last_name", "")]
-    display_name = " ".join(p for p in name_parts if p).strip() or "(no name on file)"
+        with _lock:
+            _verified_customer_ids.add(cid_norm)
 
-    with _lock:
-        already = cid_norm in _verified_customer_ids
-
-    if already:
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": f"Already allowlisted: *{display_name}* (`{cid_full}`).",
-        }), 200
-
-    entry = {
-        "customer_id":         cid_full,
-        "card_first_name":     found.get("card_first_name", ""),
-        "card_last_name":      found.get("card_last_name", ""),
-        "card_email":          found.get("card_email", ""),
-        "note":                note,
-        "added_at":            datetime.now(UTC).isoformat(),
-        "added_by_payment_id": found.get("payment_id", ""),
-    }
-    try:
-        inserted = db.add_verified_customer(entry)
-    except Exception as exc:
-        print(f"[allowlist] DB insert failed: {exc}")
-        return jsonify({
-            "response_type": "ephemeral",
-            "text": f"Allowlist failed: DB insert error ({exc}). Try again or use the CLI.",
-        }), 200
-
-    with _lock:
-        _verified_customer_ids.add(cid_norm)
-
-    print(f"[{_ts()}] ⊕ ALLOWLISTED {display_name} ({cid_full}) by @{user}"
-          + (f" — note: {note}" if note else ""))
-
-    audit_text = (
-        f"⊕ *{display_name}* (`{cid_full}`) allowlisted by @{user} "
-        f"— auto-ban now suppressed (manual ban still works)."
-    )
-    if note:
-        audit_text += f"\n_Note: {note}_"
-    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
-        _post_to_slack(
-            _slack_color("clean"),
-            [{"type": "context", "elements": [{"type": "mrkdwn", "text": audit_text}]}],
+        print(f"[{_ts()}] ⊕ ALLOWLISTED {display_name} ({cid_full}) by @{user}")
+        _replace_actions(
+            f"⊕ Allowlisted *{display_name}* by @{user} — auto-ban suppressed (manual ban still works)."
         )
 
-    reply = f"✅ Allowlisted *{display_name}* (`{cid_full}`)."
-    if not inserted:
-        # Should be rare given the in-memory check above, but cover the race.
-        reply = f"⊕ Already allowlisted: *{display_name}* (`{cid_full}`)."
-    reply += " Auto-ban suppressed; *manual ban via the fraud-alert button is still available.*"
-
-    return jsonify({"response_type": "ephemeral", "text": reply}), 200
+    return "", 200
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
